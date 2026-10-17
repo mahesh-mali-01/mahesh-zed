@@ -63,6 +63,7 @@ use settings::{
 use std::{
     borrow::Cow,
     cmp::Ordering,
+    ops::RangeInclusive,
     sync::{Arc, atomic},
 };
 use std::{cell::RefCell, future::Future, rc::Rc, sync::atomic::AtomicBool, time::Instant};
@@ -3590,6 +3591,26 @@ async fn test_newest_selection_on_screen_with_multibyte_chars(cx: &mut TestAppCo
         assert_eq!(
             editor.newest_selection_on_screen(window, cx),
             Ordering::Greater
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_newest_selection_left_of_screen_below_top_row(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state(&format!("\n{}ˇ{}\n", "a".repeat(30), "a".repeat(70)));
+    cx.update_editor(|editor, window, cx| {
+        editor.set_visible_line_count(50., window, cx);
+        editor.set_visible_column_count(20.);
+        let mut on_screen_at = |scroll_x: f64| {
+            editor.set_scroll_position(gpui::Point::new(scroll_x, 0.), window, cx);
+            editor.newest_selection_on_screen(window, cx)
+        };
+        assert_eq!(
+            [on_screen_at(0.), on_screen_at(20.), on_screen_at(40.)],
+            [Ordering::Greater, Ordering::Equal, Ordering::Less]
         );
     });
 }
@@ -14092,13 +14113,20 @@ async fn test_visible_display_columns_stay_inside_fractional_viewport(cx: &mut T
             let snapshot = editor.display_snapshot(cx);
             let row = DisplayRow(0);
             let column_width = snapshot.x_for_display_point(DisplayPoint::new(row, 1), &details);
-            assert_eq!(
+            let visible_columns = |columns: RangeInclusive<f64>| {
                 snapshot.visible_display_columns(
                     row,
-                    20.25 * column_width..=59.75 * column_width,
-                    &details
-                ),
-                20..=59,
+                    columns.start() * column_width..=columns.end() * column_width,
+                    &details,
+                )
+            };
+            assert_eq!(
+                [
+                    visible_columns(20.25..=59.75),
+                    visible_columns(0.6..=0.9),
+                    visible_columns(len as f64 + 0.5..=len as f64 + 40.),
+                ],
+                [Some(20..=59), Some(0..=0), None],
                 "row of {len} characters"
             );
         });

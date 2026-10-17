@@ -1082,12 +1082,7 @@ impl Editor {
                     SelectionEffects::scroll(Autoscroll::newest()),
                     window,
                     cx,
-                    |s| {
-                        s.select_anchors_unexpanded(
-                            entry.selections.to_vec(),
-                            entry.goal_origins.clone(),
-                        )
-                    },
+                    |s| s.select_anchors_unexpanded(entry.selections.to_vec()),
                 );
             });
             self.selection_history.mode = SelectionHistoryMode::Normal;
@@ -1112,12 +1107,7 @@ impl Editor {
                     SelectionEffects::scroll(Autoscroll::newest()),
                     window,
                     cx,
-                    |s| {
-                        s.select_anchors_unexpanded(
-                            entry.selections.to_vec(),
-                            entry.goal_origins.clone(),
-                        )
-                    },
+                    |s| s.select_anchors_unexpanded(entry.selections.to_vec()),
                 );
             });
             self.selection_history.mode = SelectionHistoryMode::Normal;
@@ -2082,7 +2072,6 @@ impl Editor {
     fn selection_history_entry(&self) -> SelectionHistoryEntry {
         SelectionHistoryEntry {
             selections: self.selections.disjoint_anchors_arc(),
-            goal_origins: self.selections.goal_origins(),
             select_next_state: self.select_next_state.clone(),
             select_prev_state: self.select_prev_state.clone(),
             add_selections_state: self.add_selections_state.clone(),
