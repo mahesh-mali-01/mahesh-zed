@@ -7296,6 +7296,102 @@ impl Repository {
         }
     }
 
+    pub fn review_history(
+        &self,
+        base: Option<git::Oid>,
+        head: git::Oid,
+        cx: &App,
+    ) -> Task<Result<Vec<git::review::ReviewCommit>>> {
+        let state = self.repository_state.clone();
+        let limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = limiter.acquire_arc().await;
+            match state.await.map_err(|error| anyhow::anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.review_history(base, head).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("commit review currently supports local repositories only")
+                }
+            }
+        })
+    }
+
+    pub fn review_commits(
+        &self,
+        selections: Vec<git::review::ReviewCommitSelection>,
+        range: bool,
+        cx: &App,
+    ) -> Task<Result<Vec<git::review::ReviewComparison>>> {
+        let state = self.repository_state.clone();
+        let limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = limiter.acquire_arc().await;
+            match state.await.map_err(|error| anyhow::anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.review_commits(selections, range).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("commit review currently supports local repositories only")
+                }
+            }
+        })
+    }
+
+    pub fn review_comparison(
+        &self,
+        base: String,
+        head: String,
+        merge_base: bool,
+        cx: &App,
+    ) -> Task<Result<git::review::ReviewComparison>> {
+        let state = self.repository_state.clone();
+        let limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = limiter.acquire_arc().await;
+            match state.await.map_err(|error| anyhow::anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.review_comparison(base, head, merge_base).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("incremental review currently supports local repositories only")
+                }
+            }
+        })
+    }
+
+    pub fn review_blob_sizes(&self, objects: Vec<git::Oid>, cx: &App) -> Task<Result<Vec<u64>>> {
+        let state = self.repository_state.clone();
+        let limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = limiter.acquire_arc().await;
+            match state.await.map_err(|error| anyhow::anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.review_blob_sizes(objects).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("Review size probes currently support local repositories only")
+                }
+            }
+        })
+    }
+
+    pub fn review_blob(&self, object: git::Oid, cx: &App) -> Task<Result<Vec<u8>>> {
+        let state = self.repository_state.clone();
+        let limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = limiter.acquire_arc().await;
+            match state.await.map_err(|error| anyhow::anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.load_blob_content(object).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("incremental review currently supports local repositories only")
+                }
+            }
+        })
+    }
+
     pub fn load_commit_diff(
         &self,
         commit: String,
@@ -8783,6 +8879,33 @@ impl Repository {
         })
         .detach();
         rx
+    }
+
+    /// Isolated refs let PR fetches run outside the serialized working-tree job
+    /// queue. The UI owns this task; dropping it cancels the fetch subprocess.
+    pub fn fetch_review_pr(
+        &mut self,
+        request: git::repository::ReviewPrFetch,
+        askpass: AskPassDelegate,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<git::repository::VerifiedReviewPr>> {
+        let state = self.repository_state.clone();
+        cx.spawn(
+            async move |_, cx| match state.await.map_err(|error| anyhow::anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState {
+                    backend,
+                    environment,
+                    ..
+                }) => {
+                    backend
+                        .fetch_review_pr(request, askpass, environment, cx.clone())
+                        .await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("PR fetching currently supports local repositories only")
+                }
+            },
+        )
     }
 
     pub fn fetch(
@@ -12224,6 +12347,39 @@ mod tests {
 
         gate.open();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_review_reads_share_limit_and_return_raw_bytes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (gate, repository, oids) =
+            setup_gated_blob_reads(cx, MAX_CONCURRENT_OBJECT_READS + 1).await;
+        let holding = oids
+            .iter()
+            .take(MAX_CONCURRENT_OBJECT_READS)
+            .map(|oid| repository.read_with(cx, |repo, cx| repo.review_blob(*oid, cx)))
+            .collect::<Vec<_>>();
+        cx.run_until_parked();
+        assert_eq!(gate.waiting(), MAX_CONCURRENT_OBJECT_READS);
+        let raw = repository.read_with(cx, |repo, cx| {
+            repo.review_blob(oids[MAX_CONCURRENT_OBJECT_READS], cx)
+        });
+        let mut comparison = repository.read_with(cx, |repo, cx| {
+            repo.review_comparison("main".into(), "HEAD".into(), true, cx)
+        });
+        cx.run_until_parked();
+        assert!(!gate.is_waiting(oids[MAX_CONCURRENT_OBJECT_READS]));
+        assert!((&mut comparison).now_or_never().is_none());
+        gate.open();
+        cx.run_until_parked();
+        for task in holding {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            raw.await.unwrap(),
+            format!("blob-{:02}\n", MAX_CONCURRENT_OBJECT_READS).as_bytes()
+        );
+        assert!(comparison.await.is_err());
     }
 
     #[gpui::test]

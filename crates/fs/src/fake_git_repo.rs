@@ -83,6 +83,9 @@ pub struct FakeGitRepositoryState {
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
+    pub review_read_gate: Option<FakeBlobReadGate>,
+    pub review_history: Vec<git::review::ReviewCommit>,
+    pub review_comparisons: HashMap<(String, String, bool), git::review::ReviewComparison>,
 }
 
 impl FakeGitRepositoryState {
@@ -90,6 +93,9 @@ impl FakeGitRepositoryState {
         FakeGitRepositoryState {
             event_emitter,
             blob_read_gate: None,
+            review_read_gate: None,
+            review_history: Vec::new(),
+            review_comparisons: HashMap::default(),
             head_contents: Default::default(),
             index_contents: Default::default(),
             unmerged_paths: Default::default(),
@@ -266,8 +272,92 @@ impl FakeGitRepository {
 }
 
 impl GitRepository for FakeGitRepository {
+    fn review_history(
+        &self,
+        _base: Option<Oid>,
+        _head: Oid,
+    ) -> BoxFuture<'_, Result<Vec<git::review::ReviewCommit>>> {
+        self.with_state_async(false, |state| Ok(state.review_history.clone()))
+    }
+
+    fn review_commits(
+        &self,
+        selections: Vec<git::review::ReviewCommitSelection>,
+        range: bool,
+    ) -> BoxFuture<'_, Result<Vec<git::review::ReviewComparison>>> {
+        self.with_state_async(false, move |state| {
+            let endpoints = if range {
+                vec![(
+                    selections.first().context("range start")?.parent,
+                    selections.last().context("range end")?.commit,
+                )]
+            } else {
+                selections
+                    .into_iter()
+                    .map(|selection| (selection.parent, selection.commit))
+                    .collect()
+            };
+            endpoints
+                .into_iter()
+                .map(|(left, right)| {
+                    state
+                        .review_comparisons
+                        .get(&(
+                            left.map(|left| left.to_string()).unwrap_or_default(),
+                            right.to_string(),
+                            false,
+                        ))
+                        .cloned()
+                        .context("selected commit metadata unavailable")
+                })
+                .collect()
+        })
+    }
+
+    fn review_comparison(
+        &self,
+        base: String,
+        head: String,
+        merge_base: bool,
+    ) -> BoxFuture<'_, Result<git::review::ReviewComparison>> {
+        let comparison_and_gate = self.with_state_async(false, move |state| {
+            Ok((
+                state
+                    .review_comparisons
+                    .get(&(base, head, merge_base))
+                    .cloned(),
+                state.review_read_gate.clone(),
+            ))
+        });
+        async move {
+            let (comparison, gate) = comparison_and_gate.await?;
+            let comparison = comparison.context("review refs or history unavailable")?;
+            if let Some(gate) = gate {
+                gate.wait(comparison.right).await;
+            }
+            Ok(comparison)
+        }
+        .boxed()
+    }
+
     fn load_commit_template(&self) -> BoxFuture<'_, Result<Option<GitCommitTemplate>>> {
         self.with_state_async(false, |state| Ok(state.commit_template.clone()))
+    }
+
+    fn review_blob_sizes(&self, objects: Vec<Oid>) -> BoxFuture<'_, Result<Vec<u64>>> {
+        self.with_state_async(false, move |state| {
+            anyhow::ensure!(objects.len() <= 128, "Review size batch exceeds limit");
+            objects
+                .iter()
+                .map(|oid| {
+                    state
+                        .oids
+                        .get(oid)
+                        .map(|bytes| bytes.len() as u64)
+                        .context("oid does not exist")
+                })
+                .collect()
+        })
     }
 
     fn load_blob_content(&self, oid: git::Oid) -> BoxFuture<'_, Result<Vec<u8>>> {

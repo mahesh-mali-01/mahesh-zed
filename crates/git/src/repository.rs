@@ -663,6 +663,54 @@ pub enum ResetMode {
     Mixed,
 }
 
+/// A pinned GitHub PR fetch. Remote identity and revisions come from verified API metadata.
+#[derive(Clone, Debug)]
+pub struct ReviewPrFetch {
+    pub owner: String,
+    pub repository: String,
+    pub base_branch: String,
+    pub number: u64,
+    pub expected_base: Oid,
+    pub expected_head: Oid,
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifiedReviewPr {
+    pub base: Oid,
+    pub head: Oid,
+    pub base_ref: String,
+    pub head_ref: String,
+}
+
+impl ReviewPrFetch {
+    fn validate(&self) -> Result<()> {
+        for component in [&self.owner, &self.repository] {
+            anyhow::ensure!(
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && component
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)),
+                "Invalid GitHub repository identity"
+            );
+        }
+        anyhow::ensure!(
+            self.number > 0 && self.number <= i32::MAX as u64,
+            "Invalid PR number"
+        );
+        anyhow::ensure!(
+            !self.base_branch.is_empty() && !self.base_branch.contains('\0'),
+            "Invalid base branch"
+        );
+        anyhow::ensure!(
+            !self.expected_base.is_zero() && !self.expected_head.is_zero(),
+            "Invalid PR revision"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum FetchOptions {
     All,
@@ -844,6 +892,36 @@ pub trait GitRepository: Send + Sync {
 
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>>;
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>>;
+
+    fn review_blob_sizes(&self, _objects: Vec<Oid>) -> BoxFuture<'_, Result<Vec<u64>>> {
+        async { bail!("Review blob sizes are unsupported by this Git backend") }.boxed()
+    }
+
+    fn review_history(
+        &self,
+        _base: Option<Oid>,
+        _head: Oid,
+    ) -> BoxFuture<'_, Result<Vec<crate::review::ReviewCommit>>> {
+        async { anyhow::bail!("commit review is unsupported by this Git backend") }.boxed()
+    }
+
+    fn review_commits(
+        &self,
+        _selections: Vec<crate::review::ReviewCommitSelection>,
+        _range: bool,
+    ) -> BoxFuture<'_, Result<Vec<crate::review::ReviewComparison>>> {
+        async { anyhow::bail!("commit review is unsupported by this Git backend") }.boxed()
+    }
+
+    fn review_comparison(
+        &self,
+        _base: String,
+        _head: String,
+        _merge_base: bool,
+    ) -> BoxFuture<'_, Result<crate::review::ReviewComparison>> {
+        async { anyhow::bail!("immutable review comparisons are unsupported by this Git backend") }
+            .boxed()
+    }
 
     fn stash_entries(&self) -> BoxFuture<'static, Result<GitStash>>;
 
@@ -1049,6 +1127,17 @@ pub trait GitRepository: Send + Sync {
         // otherwise git-credentials-manager won't work.
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<RemoteCommandOutput>>;
+
+    /// Local-only PR-object fetch; remote transports must opt in explicitly.
+    fn fetch_review_pr(
+        &self,
+        _request: ReviewPrFetch,
+        _askpass: AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<VerifiedReviewPr>> {
+        async { bail!("PR fetching is unsupported by this Git backend") }.boxed()
+    }
 
     fn get_push_remote(&self, branch: String) -> BoxFuture<'_, Result<Option<Remote>>>;
 
@@ -1415,6 +1504,58 @@ fn parse_remote_urls(stdout: &str) -> HashMap<String, String> {
 }
 
 impl GitRepository for RealGitRepository {
+    fn review_blob_sizes(&self, objects: Vec<Oid>) -> BoxFuture<'_, Result<Vec<u64>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                anyhow::ensure!(objects.len() <= 128, "Too many review size probes");
+                let mut sizes = Vec::with_capacity(objects.len());
+                for object in objects {
+                    anyhow::ensure!(!object.is_zero(), "Invalid review object");
+                    let size = git.run(&["cat-file", "-s", &object.to_string()]).await?;
+                    sizes.push(size.parse().context("Invalid Git object size")?);
+                }
+                Ok(sizes)
+            })
+            .boxed()
+    }
+
+    fn review_history(
+        &self,
+        base: Option<Oid>,
+        head: Oid,
+    ) -> BoxFuture<'_, Result<Vec<crate::review::ReviewCommit>>> {
+        self.executor
+            .spawn(crate::review::history(self.git_binary(), base, head))
+            .boxed()
+    }
+
+    fn review_commits(
+        &self,
+        selections: Vec<crate::review::ReviewCommitSelection>,
+        range: bool,
+    ) -> BoxFuture<'_, Result<Vec<crate::review::ReviewComparison>>> {
+        self.executor
+            .spawn(crate::review::commits(self.git_binary(), selections, range))
+            .boxed()
+    }
+
+    fn review_comparison(
+        &self,
+        base: String,
+        head: String,
+        merge_base: bool,
+    ) -> BoxFuture<'_, Result<crate::review::ReviewComparison>> {
+        self.executor
+            .spawn(crate::review::load(
+                self.git_binary(),
+                base,
+                head,
+                merge_base,
+            ))
+            .boxed()
+    }
+
     fn path(&self) -> PathBuf {
         self.git_dir.clone()
     }
@@ -2958,6 +3099,36 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn fetch_review_pr(
+        &self,
+        request: ReviewPrFetch,
+        askpass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<VerifiedReviewPr>> {
+        let git = self.git_binary();
+        let executor = cx.background_executor().clone();
+        async move {
+            request.validate()?;
+            let source = format!("https://github.com/{}/{}.git", request.owner, request.repository);
+            let (mut command, refs) = review_pr_fetch_command(&git, &request, &source, true).await?;
+            command.envs(env.iter()).env_remove("GH_DEBUG").kill_on_drop(true);
+            let mut attempt = ReviewPrAttempt::new(git.clone(), refs.clone());
+            {
+            let operation = run_git_command_inner(env, askpass, command, executor.clone(), Some(&mut attempt)).fuse();
+            let timeout = executor.timer(std::time::Duration::from_secs(300)).fuse();
+            futures::pin_mut!(operation, timeout);
+            select_biased! {
+                result = operation => { result.map_err(|_| anyhow!("Could not fetch PR objects; check GitHub access and connectivity"))?; }
+                _ = timeout => bail!("PR object fetch timed out"),
+            }
+            }
+            let verified = verify_review_pr_fetch(&git, &request, refs).await?;
+            attempt.accepted = true;
+            Ok(verified)
+        }.boxed()
+    }
+
     fn get_push_remote(&self, branch: String) -> BoxFuture<'_, Result<Option<Remote>>> {
         let git = self.git_binary();
         self.executor
@@ -3897,6 +4068,7 @@ async fn add_files_to_index(git: &GitBinary, files: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub(crate) struct GitBinary {
     git_binary_path: PathBuf,
     working_directory: PathBuf,
@@ -4053,15 +4225,231 @@ struct GitBinaryCommandError {
     status: ExitStatus,
 }
 
+// URL injection is impossible in production: callers supply the canonical URL
+// constructed from validated components. The separate source supports local-Git fixtures.
+async fn review_pr_fetch_command(
+    git: &GitBinary,
+    request: &ReviewPrFetch,
+    source: &str,
+    github_credentials: bool,
+) -> Result<(util::command::Command, VerifiedReviewPr)> {
+    request.validate()?;
+    git.run(&[
+        "check-ref-format",
+        &format!("refs/heads/{}", request.base_branch),
+    ])
+    .await?;
+    let namespace = format!(
+        "refs/zed/review/pr/{}/{}",
+        request.number,
+        Uuid::new_v4().simple()
+    );
+    let refs = VerifiedReviewPr {
+        base: request.expected_base,
+        head: request.expected_head,
+        base_ref: format!("{namespace}/base"),
+        head_ref: format!("{namespace}/head"),
+    };
+    let mut args = vec![
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "fetch.writeCommitGraph=false",
+    ];
+    if github_credentials {
+        args.extend([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.helper=!gh auth git-credential",
+        ]);
+    }
+    args.extend([
+        "fetch",
+        "--atomic",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        "--refmap=",
+        "--",
+    ]);
+    let mut command = git.build_command(&args);
+    command
+        .arg(source)
+        .arg(format!(
+            "refs/heads/{}:{}",
+            request.base_branch, refs.base_ref
+        ))
+        .arg(format!(
+            "refs/pull/{}/head:{}",
+            request.number, refs.head_ref
+        ))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env_remove("GH_DEBUG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    Ok((command, refs))
+}
+
+async fn verify_review_pr_fetch(
+    git: &GitBinary,
+    request: &ReviewPrFetch,
+    refs: VerifiedReviewPr,
+) -> Result<VerifiedReviewPr> {
+    for (reference, expected) in [
+        (&refs.base_ref, request.expected_base),
+        (&refs.head_ref, request.expected_head),
+    ] {
+        let resolved = git
+            .run(&[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{reference}^{{commit}}"),
+            ])
+            .await?;
+        anyhow::ensure!(
+            Oid::from_str(&resolved)? == expected,
+            "PR revisions changed during fetch; refresh the PR before opening files"
+        );
+    }
+    Ok(refs)
+}
+
+// Cleanup waits for the killed child to be reaped, so a cancelled fetch cannot
+// install its refs after cleanup. Every deletion uses the observed old OID CAS.
+struct ReviewPrAttempt {
+    git: Option<GitBinary>,
+    refs: VerifiedReviewPr,
+    completion: Option<
+        futures::future::Shared<BoxFuture<'static, std::result::Result<ExitStatus, String>>>,
+    >,
+    child: Option<Arc<Mutex<util::command::Child>>>,
+    accepted: bool,
+}
+impl ReviewPrAttempt {
+    fn new(git: GitBinary, refs: VerifiedReviewPr) -> Self {
+        Self {
+            git: Some(git),
+            refs,
+            completion: None,
+            child: None,
+            accepted: false,
+        }
+    }
+}
+impl Drop for ReviewPrAttempt {
+    fn drop(&mut self) {
+        if self.accepted {
+            return;
+        }
+        if let Some(child) = self.child.take() {
+            let mut child = child.lock();
+            if !matches!(child.try_status(), Ok(Some(_))) {
+                child.kill().log_err();
+            }
+        }
+        if let Some(git) = self.git.take() {
+            let refs = self.refs.clone();
+            let completion = self.completion.take();
+            git.executor
+                .clone()
+                .spawn(async move {
+                    if let Some(completion) = completion {
+                        completion.await.log_err();
+                    }
+                    cleanup_review_pr_refs(&git, &refs).await.log_err();
+                })
+                .detach();
+        }
+    }
+}
+async fn cleanup_review_pr_refs(git: &GitBinary, refs: &VerifiedReviewPr) -> Result<()> {
+    for reference in [&refs.base_ref, &refs.head_ref] {
+        let output = git
+            .build_command(&["rev-parse", "--verify", "--quiet", reference])
+            .output()
+            .await?;
+        if output.status.success() {
+            let old = Oid::from_str(std::str::from_utf8(&output.stdout)?.trim())?;
+            // Disable hooks for cleanup as well as creation of private refs.
+            git.run(&[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                "-d",
+                reference,
+                &old.to_string(),
+            ])
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn review_pr_child_output(
+    mut child: util::command::Child,
+    attempt: &mut ReviewPrAttempt,
+) -> Result<Output> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let completion = child
+        .status()
+        .map(|result| result.map_err(|_| "Could not wait for PR fetch".to_string()))
+        .boxed()
+        .shared();
+    attempt.completion = Some(completion.clone());
+    attempt.child = Some(Arc::new(Mutex::new(child)));
+    let stdout = async move {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stdout {
+            pipe.read_to_end(&mut bytes).await?;
+        }
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let stderr = async move {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stderr {
+            pipe.read_to_end(&mut bytes).await?;
+        }
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let (stdout, stderr) = futures::try_join!(stdout, stderr)?;
+    let status = completion.await.map_err(anyhow::Error::msg)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 async fn run_git_command(
+    env: Arc<HashMap<String, String>>,
+    ask_pass: AskPassDelegate,
+    command: util::command::Command,
+    executor: BackgroundExecutor,
+) -> Result<RemoteCommandOutput> {
+    run_git_command_inner(env, ask_pass, command, executor, None).await
+}
+
+async fn run_git_command_inner(
     env: Arc<HashMap<String, String>>,
     ask_pass: AskPassDelegate,
     mut command: util::command::Command,
     executor: BackgroundExecutor,
+    mut attempt: Option<&mut ReviewPrAttempt>,
 ) -> Result<RemoteCommandOutput> {
     if env.contains_key("GIT_ASKPASS") {
         let git_process = command.spawn()?;
-        let output = git_process.output().await?;
+        let output = if let Some(attempt) = attempt.as_deref_mut() {
+            review_pr_child_output(git_process, attempt).await?
+        } else {
+            git_process.output().await?
+        };
         anyhow::ensure!(
             output.status.success(),
             "{}",
@@ -4090,14 +4478,14 @@ async fn run_git_command(
         #[cfg(target_os = "windows")]
         command.env("ZED_ASKPASS_SOCKET", ask_pass.socket_path());
         let git_process = command.spawn()?;
-
-        run_askpass_command(ask_pass, git_process).await
+        run_askpass_command(ask_pass, git_process, attempt).await
     }
 }
 
 async fn run_askpass_command(
     mut ask_pass: AskPassSession,
     git_process: util::command::Child,
+    attempt: Option<&mut ReviewPrAttempt>,
 ) -> anyhow::Result<RemoteCommandOutput> {
     select_biased! {
         // Git can legitimately run long without prompting (e.g. large fetches,
@@ -4113,7 +4501,13 @@ async fn run_askpass_command(
                 }
             }
         }
-        output = git_process.output().fuse() => {
+        output = async move {
+            if let Some(attempt) = attempt {
+                review_pr_child_output(git_process, attempt).await
+            } else {
+                git_process.output().await.map_err(anyhow::Error::from)
+            }
+        }.fuse() => {
             let output = output?;
             anyhow::ensure!(
                 output.status.success(),
@@ -4456,6 +4850,589 @@ mod tests {
         assert_eq!(
             fs::canonicalize(left.as_ref()).unwrap(),
             fs::canonicalize(right.as_ref()).unwrap()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_review_commit_scopes_match_git_and_reject_missing_history(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::review::ReviewCommitSelection;
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git_init_repo(path);
+        fs::write(path.join("auth.ts"), "base\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "root"]);
+        let root: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let mut chain = vec![root];
+        for (file, contents) in [
+            ("auth.ts", "first\n"),
+            ("billing.ts", "billing\n"),
+            ("auth.ts", "third\n"),
+        ] {
+            fs::write(path.join(file), contents).unwrap();
+            git_command(path, ["add", "."]);
+            git_command(path, ["commit", "-m", file]);
+            chain.push(
+                git_command_output(path, ["rev-parse", "HEAD"])
+                    .parse::<Oid>()
+                    .unwrap(),
+            );
+        }
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let history = repository
+            .review_history(Some(root), chain[3])
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|commit| commit.commit)
+                .collect::<Vec<_>>(),
+            vec![chain[3], chain[2], chain[1]]
+        );
+        assert_eq!(history[0].parents, vec![chain[2]]);
+        let select = |index: usize| ReviewCommitSelection {
+            commit: chain[index],
+            parent: index.checked_sub(1).map(|parent| chain[parent]),
+        };
+        fs::write(path.join("auth.ts"), "staged\n").unwrap();
+        git_command(path, ["add", "auth.ts"]);
+        fs::write(path.join("auth.ts"), "disk-only\n").unwrap();
+        let index = fs::read(path.join(".git/index")).unwrap();
+        let objects_before = git_command_output(path, ["count-objects", "-v"]);
+        let root_diff = repository
+            .review_commits(vec![select(0)], false)
+            .await
+            .unwrap();
+        assert_eq!(root_diff[0].files.len(), 1);
+        assert!(root_diff[0].files[0].old.is_none());
+        assert_eq!(root_diff[0].right, root);
+        let groups = repository
+            .review_commits(vec![select(1), select(3)], false)
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        for (group, selected) in groups.iter().zip([select(1), select(3)]) {
+            assert_eq!(group.left, selected.parent.unwrap());
+            assert_eq!(group.right, selected.commit);
+            assert_eq!(group.files.len(), 1);
+            assert_eq!(group.files[0].path.as_unix_str(), "auth.ts");
+            let expected =
+                git_command_output(path, ["rev-parse", &format!("{}:auth.ts", selected.commit)]);
+            assert_eq!(
+                group.files[0].new.as_ref().unwrap().object.to_string(),
+                expected
+            );
+        }
+        let range = repository
+            .review_commits(vec![select(1), select(2), select(3)], true)
+            .await
+            .unwrap();
+        assert_eq!(range.len(), 1);
+        assert_eq!((range[0].left, range[0].right), (root, chain[3]));
+        assert_eq!(range[0].files.len(), 2);
+        let root_range = repository
+            .review_commits(vec![select(0), select(1)], true)
+            .await
+            .unwrap();
+        assert!(root_range[0].files[0].old.is_none());
+        assert_eq!(root_range[0].right, chain[1]);
+        assert!(
+            repository
+                .review_commits(vec![select(1), select(3)], true)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .review_commits(vec![select(2), select(1)], true)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .review_commits(vec![select(1), select(1)], false)
+                .await
+                .is_err()
+        );
+        assert!(repository.review_commits(vec![], false).await.is_err());
+        assert!(
+            repository
+                .review_commits(
+                    vec![ReviewCommitSelection {
+                        commit: chain[3],
+                        parent: Some(root)
+                    }],
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .review_commits(
+                    vec![ReviewCommitSelection {
+                        commit: chain[3],
+                        parent: None
+                    }],
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            git_command_output(path, ["rev-parse", "HEAD"]),
+            chain[3].to_string()
+        );
+        assert_eq!(fs::read(path.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            fs::read_to_string(path.join("auth.ts")).unwrap(),
+            "disk-only\n"
+        );
+        assert_eq!(
+            git_command_output(path, ["count-objects", "-v"]),
+            objects_before
+        );
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        let shallow = clone_dir.path().join("shallow");
+        git_command(
+            clone_dir.path(),
+            [
+                "clone",
+                "--depth=1",
+                &format!("file://{}", path.display()),
+                shallow.to_str().unwrap(),
+            ],
+        );
+        let shallow_repo = RealGitRepository::new(
+            &shallow.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let shallow_history = shallow_repo
+            .review_history(None, chain[3])
+            .await
+            .unwrap_err();
+        assert!(shallow_history.to_string().contains("missing"));
+        assert!(
+            shallow_repo
+                .review_commits(vec![select(3)], false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+        assert!(
+            shallow_repo
+                .review_commits(
+                    vec![ReviewCommitSelection {
+                        commit: chain[3],
+                        parent: None
+                    }],
+                    false
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_review_history_batches_more_than_2000_commits_and_preserves_merge_membership(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::review::ReviewCommitSelection;
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git_init_repo(path);
+        // One fast-import process generates a large real object graph without
+        // thousands of commit/checkout subprocesses or unrelated file changes.
+        const LAST_LINEAR: usize = 2052;
+        let mut input = String::new();
+        for mark in 1..=LAST_LINEAR {
+            let message = format!("history {mark}");
+            input.push_str(&format!("commit refs/heads/fixture\nmark :{mark}\ncommitter Review Fixture <fixture@example.invalid> 1700000000 +0000\ndata {}\n{message}\n",message.len()));
+            if mark > 1 {
+                input.push_str(&format!("from :{}\n", mark - 1));
+            }
+            input.push('\n');
+        }
+        input.push_str(&format!("commit refs/heads/side\nmark :{}\ncommitter Review Fixture <fixture@example.invalid> 1700000000 +0000\ndata 4\nside\nfrom :1\n\n",LAST_LINEAR+1));
+        input.push_str(&format!("commit refs/heads/merged\nmark :{}\ncommitter Review Fixture <fixture@example.invalid> 1700000000 +0000\ndata 5\nmerge\nfrom :{LAST_LINEAR}\nmerge :{}\n\ndone\n",LAST_LINEAR+2,LAST_LINEAR+1));
+        let binary = GitBinary::new(
+            "git".into(),
+            path.to_path_buf(),
+            path.join(".git"),
+            cx.executor(),
+            true,
+        );
+        let mut child = binary
+            .build_command(&["fast-import", "--quiet"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .await
+            .unwrap();
+        let imported = child.output().await.unwrap();
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let oid = |revision: &str| {
+            git_command_output(path, ["rev-parse", revision])
+                .parse::<Oid>()
+                .unwrap()
+        };
+        let head = oid("fixture");
+        let root = oid(&format!("fixture~{}", LAST_LINEAR - 1));
+        let first = oid(&format!("fixture~{}", LAST_LINEAR - 2));
+        let side = oid("side");
+        let merged = oid("merged");
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        fs::write(path.join("untouched-sentinel"), "local-only").unwrap();
+        let refs_before = git_command_output(path, ["show-ref"]);
+        let index_before = fs::read(path.join(".git/index")).ok();
+        let objects_before = git_command_output(path, ["count-objects", "-v"]);
+        let history = repository.review_history(Some(root), head).await.unwrap();
+        assert_eq!(history.len(), LAST_LINEAR - 1);
+        assert_eq!(history.first().unwrap().commit, head);
+        assert_eq!(history.last().unwrap().commit, first);
+        assert_eq!(history.last().unwrap().parents, vec![root]);
+        assert_eq!(
+            history.first().unwrap().subject,
+            format!("history {LAST_LINEAR}")
+        );
+        let selections = history
+            .iter()
+            .rev()
+            .map(|commit| ReviewCommitSelection {
+                commit: commit.commit,
+                parent: commit.parents.first().copied(),
+            })
+            .collect();
+        let range = repository.review_commits(selections, true).await.unwrap();
+        assert_eq!(range.len(), 1);
+        assert_eq!((range[0].left, range[0].right), (root, head));
+        let merged_history = repository.review_history(Some(root), merged).await.unwrap();
+        assert_eq!(merged_history.len(), LAST_LINEAR + 1);
+        assert_eq!(merged_history[0].commit, merged);
+        assert_eq!(merged_history[0].parents, vec![head, side]);
+        let ids = merged_history
+            .iter()
+            .map(|commit| commit.commit)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(ids.contains(&side));
+        assert!(!ids.contains(&root));
+        assert!(history.iter().all(|commit| ids.contains(&commit.commit)));
+        let excluded_side = repository.review_history(Some(side), merged).await.unwrap();
+        assert_eq!(excluded_side.len(), LAST_LINEAR);
+        assert!(
+            !excluded_side
+                .iter()
+                .any(|commit| commit.commit == side || commit.commit == root)
+        );
+        assert_eq!(git_command_output(path, ["show-ref"]), refs_before);
+        assert_eq!(fs::read(path.join(".git/index")).ok(), index_before);
+        assert_eq!(
+            git_command_output(path, ["count-objects", "-v"]),
+            objects_before
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("untouched-sentinel")).unwrap(),
+            "local-only"
+        );
+        // An unrelated shallow boundary does not invalidate complete selected
+        // history, but a reachable boundary cannot silently truncate the list.
+        fs::write(path.join(".git/shallow"), format!("{side}\n")).unwrap();
+        assert_eq!(
+            repository
+                .review_history(Some(root), head)
+                .await
+                .unwrap()
+                .len(),
+            LAST_LINEAR - 1
+        );
+        fs::write(path.join(".git/shallow"), format!("{first}\n")).unwrap();
+        assert!(
+            repository
+                .review_history(Some(root), head)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("shallow")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_review_merge_requires_real_chosen_parent(cx: &mut TestAppContext) {
+        use crate::review::ReviewCommitSelection;
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git_init_repo(path);
+        fs::write(path.join("base"), "base").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "base"]);
+        git_command(path, ["switch", "-c", "side"]);
+        fs::write(path.join("side"), "side").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "side"]);
+        let side: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        git_command(path, ["switch", "main"]);
+        fs::write(path.join("main"), "main").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "main"]);
+        let main: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        git_command(path, ["merge", "--no-ff", "side", "-m", "merge"]);
+        let merge: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        assert_eq!(
+            repository.review_history(None, merge).await.unwrap()[0].parents,
+            vec![main, side]
+        );
+        assert!(
+            repository
+                .review_commits(
+                    vec![ReviewCommitSelection {
+                        commit: merge,
+                        parent: None
+                    }],
+                    false
+                )
+                .await
+                .is_err()
+        );
+        for (parent, file) in [(main, "side"), (side, "main")] {
+            let result = repository
+                .review_commits(
+                    vec![ReviewCommitSelection {
+                        commit: merge,
+                        parent: Some(parent),
+                    }],
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result[0].left, parent);
+            assert_eq!(result[0].files.len(), 1);
+            assert_eq!(result[0].files[0].path.as_unix_str(), file);
+            assert!(
+                repository
+                    .review_commits(
+                        vec![ReviewCommitSelection {
+                            commit: merge,
+                            parent: Some(parent)
+                        }],
+                        true
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_review_comparison_is_committed_rich_and_read_only(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git_init_repo(path);
+        fs::write(path.join("auth.ts"), "base\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "base"]);
+        let base = git_command_output(path, ["rev-parse", "HEAD"]);
+        git_command(path, ["switch", "-c", "feature"]);
+        fs::write(path.join("auth.ts"), "committed\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "feature"]);
+        let head = git_command_output(path, ["rev-parse", "HEAD"]);
+        git_command(path, ["switch", "main"]);
+        fs::write(path.join("base-only.txt"), "base-only\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "advance base"]);
+        git_command(path, ["switch", "feature"]);
+        fs::write(path.join("auth.ts"), "staged\n").unwrap();
+        git_command(path, ["add", "."]);
+        fs::write(path.join("auth.ts"), "disk\n").unwrap();
+        let index = fs::read(path.join(".git/index")).unwrap();
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let comparison = repository
+            .review_comparison("main".into(), "feature".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(comparison.left.to_string(), base);
+        assert_eq!(comparison.right.to_string(), head);
+        assert_eq!(comparison.files.len(), 1);
+        let file = comparison.files.first().unwrap();
+        assert_eq!(file.path.as_unix_str(), "auth.ts");
+        assert_eq!(file.old.as_ref().unwrap().mode, 0o100644);
+        assert_eq!(
+            repository
+                .load_blob_content(file.new.as_ref().unwrap().object)
+                .await
+                .unwrap(),
+            b"committed\n"
+        );
+        let direct = repository
+            .review_comparison("main".into(), "feature".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(direct.files.len(), 2);
+        assert!(
+            repository
+                .review_comparison("HEAD~1".into(), "feature".into(), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .review_comparison("missing-ref".into(), "feature".into(), true)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(path.join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(path.join("auth.ts")).unwrap(), b"disk\n");
+        assert_eq!(git_command_output(path, ["rev-parse", "HEAD"]), head);
+    }
+
+    #[gpui::test]
+    async fn test_review_metadata_across_rewrites_modes_renames_and_base_changes(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git_init_repo(path);
+        for name in ["auth.ts", "billing.ts", "remove.ts"] {
+            fs::write(path.join(name), "base\n").unwrap();
+        }
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "base"]);
+        let base = git_command_output(path, ["rev-parse", "HEAD"]);
+        git_command(path, ["switch", "-c", "feature"]);
+        for name in ["auth.ts", "billing.ts"] {
+            fs::write(path.join(name), "reviewed\n").unwrap();
+        }
+        git_command(path, ["commit", "-am", "reviewed"]);
+        let first_head = git_command_output(path, ["rev-parse", "HEAD"]);
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let initial = repository
+            .review_comparison("main".into(), "feature".into(), true)
+            .await
+            .unwrap();
+        fs::write(path.join("extra.ts"), "new\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "unrelated"]);
+        let unrelated = repository
+            .review_comparison("main".into(), "feature".into(), true)
+            .await
+            .unwrap();
+        for file in &initial.files {
+            assert!(unrelated.files.contains(file));
+        }
+        fs::write(path.join("auth.ts"), "changed again\n").unwrap();
+        git_command(path, ["commit", "-am", "changed auth"]);
+        let changed = repository
+            .review_comparison("main".into(), "feature".into(), true)
+            .await
+            .unwrap();
+        let find = |comparison: &crate::review::ReviewComparison, name: &str| {
+            comparison
+                .files
+                .iter()
+                .find(|file| file.path.as_unix_str() == name)
+                .cloned()
+                .unwrap()
+        };
+        assert_ne!(find(&initial, "auth.ts"), find(&changed, "auth.ts"));
+        assert_eq!(find(&initial, "billing.ts"), find(&changed, "billing.ts"));
+        git_command(path, ["update-index", "--chmod=+x", "billing.ts"]);
+        git_command(path, ["rm", "remove.ts"]);
+        git_command(path, ["mv", "auth.ts", "renamed.ts"]);
+        git_command(path, ["commit", "-m", "mode rename delete"]);
+        let metadata = repository
+            .review_comparison("main".into(), "feature".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(find(&metadata, "billing.ts").new.unwrap().mode, 0o100755);
+        assert!(find(&metadata, "auth.ts").new.is_none());
+        assert!(find(&metadata, "renamed.ts").old.is_none());
+        assert!(find(&metadata, "remove.ts").new.is_none());
+        git_command(path, ["update-ref", "refs/heads/feature", &first_head]);
+        let rewind = repository
+            .review_comparison("main".into(), "feature".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(rewind.files, initial.files);
+        let tree = git_command_output(path, ["rev-parse", &format!("{first_head}^{{tree}}")]);
+        let rewritten =
+            git_command_output(path, ["commit-tree", &tree, "-p", &base, "-m", "rewritten"]);
+        git_command(path, ["update-ref", "refs/heads/feature", &rewritten]);
+        let rewrite = repository
+            .review_comparison("main".into(), "feature".into(), true)
+            .await
+            .unwrap();
+        assert_ne!(rewrite.right, initial.right);
+        assert_eq!(rewrite.files, initial.files);
+        git_command(path, ["update-ref", "refs/heads/main", &first_head]);
+        let based_on_advanced = git_command_output(
+            path,
+            ["commit-tree", &tree, "-p", &first_head, "-m", "rebased"],
+        );
+        git_command(
+            path,
+            ["update-ref", "refs/heads/feature", &based_on_advanced],
+        );
+        let index = fs::read(path.join(".git/index")).unwrap();
+        let disk = fs::read(path.join("renamed.ts")).unwrap();
+        let rebased = repository
+            .review_comparison("main".into(), "feature".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(rebased.left.to_string(), first_head);
+        assert!(rebased.files.is_empty());
+        assert_eq!(fs::read(path.join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(path.join("renamed.ts")).unwrap(), disk);
+        assert_eq!(
+            git_command_output(path, ["rev-parse", "HEAD"]),
+            based_on_advanced
         );
     }
 
@@ -7089,6 +8066,383 @@ mod tests {
         assert_eq!(
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_pr_fetch_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    async fn git(cx: &TestAppContext, path: &Path, args: &[&str]) -> String {
+        let binary = GitBinary::new(
+            "git".into(),
+            path.to_path_buf(),
+            path.join(".git"),
+            cx.executor(),
+            true,
+        );
+        let output = binary
+            .build_command(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "The fixture executable and process-liveness probe are not Git commands; Git subprocesses still use GitBinary::build_command"
+    )]
+    fn fixture_process(program: impl AsRef<OsStr>) -> util::command::Command {
+        new_command(program)
+    }
+
+    #[gpui::test]
+    async fn stalled_pr_fetch_process_fixture(cx: &mut TestAppContext) {
+        let Some(root) = std::env::var_os("ZED_PR_FETCH_FIXTURE_ROOT") else {
+            return;
+        };
+        cx.executor().allow_parking();
+        let root = PathBuf::from(root);
+        let base = std::env::var("ZED_PR_FETCH_FIXTURE_BASE").unwrap();
+        let head = std::env::var("ZED_PR_FETCH_FIXTURE_HEAD").unwrap();
+        let oid = std::env::var("ZED_PR_FETCH_FIXTURE_OID").unwrap();
+        git(cx, &root, &["update-ref", &base, &oid]).await;
+        git(cx, &root, &["update-ref", &head, &oid]).await;
+        std::fs::write(
+            std::env::var_os("ZED_PR_FETCH_FIXTURE_MARKER").unwrap(),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        // This dedicated child intentionally remains alive until the parent's
+        // cancellation path kills and reaps it; never block the parent executor.
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn cancelled_pr_attempt_reaps_child_cleans_refs_and_allows_status(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let local = tempfile::tempdir().unwrap();
+        git(cx, local.path(), &["init", "-b", "main"]).await;
+        git(cx, local.path(), &["config", "user.name", "Fixture"]).await;
+        git(
+            cx,
+            local.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        )
+        .await;
+        git(cx, local.path(), &["commit", "--allow-empty", "-m", "base"]).await;
+        let oid = Oid::from_str(&git(cx, local.path(), &["rev-parse", "HEAD"]).await).unwrap();
+        let repo = RealGitRepository::new(
+            &local.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let binary = repo.git_binary();
+        let refs = VerifiedReviewPr {
+            base: oid,
+            head: oid,
+            base_ref: "refs/zed/review/pr/42/cancel/base".into(),
+            head_ref: "refs/zed/review/pr/42/cancel/head".into(),
+        };
+        let marker = local.path().join("started");
+        let mut command = fixture_process(std::env::current_exe().unwrap());
+        let fixture_name = format!(
+            "{}::stalled_pr_fetch_process_fixture",
+            module_path!().split_once("::").unwrap().1
+        );
+        command
+            .args(["--exact", &fixture_name, "--nocapture"])
+            .env("ZED_PR_FETCH_FIXTURE_ROOT", local.path())
+            .env("ZED_PR_FETCH_FIXTURE_BASE", &refs.base_ref)
+            .env("ZED_PR_FETCH_FIXTURE_HEAD", &refs.head_ref)
+            .env("ZED_PR_FETCH_FIXTURE_OID", oid.to_string())
+            .env("ZED_PR_FETCH_FIXTURE_MARKER", &marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let task_binary = binary.clone();
+        let task_refs = refs.clone();
+        let task = cx.spawn(move |mut cx| async move {
+            let mut attempt = ReviewPrAttempt::new(task_binary, task_refs);
+            let delegate =
+                AskPassDelegate::new(&mut cx, |_, _, _| panic!("unexpected credential prompt"));
+            let environment = Arc::new(HashMap::from_iter([(
+                "GIT_ASKPASS".into(),
+                "/dev/null".into(),
+            )]));
+            run_git_command_inner(
+                environment,
+                delegate,
+                command,
+                cx.background_executor().clone(),
+                Some(&mut attempt),
+            )
+            .await
+        });
+        // The external child uses wall time; pump GPUI while waiting for its marker.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "stalled process never started");
+        let pid = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            binary.run(&["status", "--porcelain"]).await.is_ok(),
+            "ordinary Git must progress while fetch stalls"
+        );
+        drop(task);
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if git(
+                cx,
+                local.path(),
+                &["for-each-ref", "refs/zed/review/pr/42/cancel"],
+            )
+            .await
+            .is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            git(
+                cx,
+                local.path(),
+                &["for-each-ref", "refs/zed/review/pr/42/cancel"]
+            )
+            .await
+            .is_empty()
+        );
+        assert!(
+            !fixture_process("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        assert!(binary.run(&["status", "--porcelain"]).await.is_ok());
+    }
+
+    #[gpui::test]
+    async fn pinned_pr_fetch_isolated_refs_preserve_checkout_and_reject_races(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let remote = tempfile::tempdir().unwrap();
+        git(cx, remote.path(), &["init", "-b", "main"]).await;
+        git(cx, remote.path(), &["config", "user.name", "Fixture"]).await;
+        git(
+            cx,
+            remote.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        )
+        .await;
+        std::fs::write(remote.path().join("file"), "base\n").unwrap();
+        git(cx, remote.path(), &["add", "file"]).await;
+        git(cx, remote.path(), &["commit", "-m", "base"]).await;
+        let base = Oid::from_str(&git(cx, remote.path(), &["rev-parse", "HEAD"]).await).unwrap();
+        git(cx, remote.path(), &["switch", "-c", "feature"]).await;
+        std::fs::write(remote.path().join("file"), "head\n").unwrap();
+        git(cx, remote.path(), &["commit", "-am", "head"]).await;
+        let head = Oid::from_str(&git(cx, remote.path(), &["rev-parse", "HEAD"]).await).unwrap();
+        git(
+            cx,
+            remote.path(),
+            &["update-ref", "refs/pull/42/head", &head.to_string()],
+        )
+        .await;
+        let local = tempfile::tempdir().unwrap();
+        git(
+            cx,
+            local.path(),
+            &["clone", remote.path().to_str().unwrap(), "."],
+        )
+        .await;
+        std::fs::write(local.path().join("file"), "dirty staged\n").unwrap();
+        git(cx, local.path(), &["add", "file"]).await;
+        std::fs::write(local.path().join("file"), "dirty unstaged\n").unwrap();
+        std::fs::write(local.path().join(".git/FETCH_HEAD"), "sentinel\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let hook = local.path().join(".git/hooks/reference-transaction");
+            std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\n").unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let original_head = git(cx, local.path(), &["rev-parse", "HEAD"]).await;
+        let original_refs = git(
+            cx,
+            local.path(),
+            &["for-each-ref", "refs/heads", "refs/remotes", "refs/tags"],
+        )
+        .await;
+        let index = std::fs::read(local.path().join(".git/index")).unwrap();
+        let config = std::fs::read(local.path().join(".git/config")).unwrap();
+        let repo = RealGitRepository::new(
+            &local.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let git_binary = repo.git_binary();
+        let blob =
+            Oid::from_str(&git(cx, local.path(), &["rev-parse", "HEAD:file"]).await).unwrap();
+        assert_eq!(repo.review_blob_sizes(vec![blob]).await.unwrap(), vec![5]);
+        assert!(repo.review_blob_sizes(vec![blob; 129]).await.is_err());
+
+        let request = ReviewPrFetch {
+            owner: "fixture".into(),
+            repository: "repository".into(),
+            base_branch: "main".into(),
+            number: 42,
+            expected_base: base,
+            expected_head: head,
+        };
+        let (mut command, refs) = review_pr_fetch_command(
+            &git_binary,
+            &request,
+            remote.path().to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let accepted = verify_review_pr_fetch(&git_binary, &request, refs)
+            .await
+            .unwrap();
+        assert!(!local.path().join("hook-ran").exists());
+        assert_eq!(accepted.base, base);
+        assert_eq!(accepted.head, head);
+        assert_eq!(
+            git(cx, local.path(), &["rev-parse", "HEAD"]).await,
+            original_head
+        );
+        assert_eq!(
+            git(
+                cx,
+                local.path(),
+                &["for-each-ref", "refs/heads", "refs/remotes", "refs/tags"]
+            )
+            .await,
+            original_refs
+        );
+        assert_eq!(
+            std::fs::read(local.path().join(".git/index")).unwrap(),
+            index
+        );
+        assert_eq!(
+            std::fs::read(local.path().join(".git/config")).unwrap(),
+            config
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.path().join("file")).unwrap(),
+            "dirty unstaged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.path().join(".git/FETCH_HEAD")).unwrap(),
+            "sentinel\n"
+        );
+        for raced in [
+            ReviewPrFetch {
+                expected_base: head,
+                ..request.clone()
+            },
+            ReviewPrFetch {
+                expected_head: base,
+                ..request.clone()
+            },
+        ] {
+            let (mut command, refs) = review_pr_fetch_command(
+                &git_binary,
+                &raced,
+                remote.path().to_str().unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_ne!(refs.base_ref, accepted.base_ref);
+            assert!(command.output().await.unwrap().status.success());
+            assert!(
+                verify_review_pr_fetch(&git_binary, &raced, refs.clone())
+                    .await
+                    .is_err()
+            );
+            cleanup_review_pr_refs(&git_binary, &refs).await.unwrap();
+            assert!(
+                git_binary
+                    .run(&["rev-parse", "--verify", &refs.base_ref])
+                    .await
+                    .is_err()
+            );
+            assert!(
+                git_binary
+                    .run(&["rev-parse", "--verify", &refs.head_ref])
+                    .await
+                    .is_err()
+            );
+        }
+        verify_review_pr_fetch(&git_binary, &request, accepted)
+            .await
+            .unwrap();
+        let invalid = ReviewPrFetch {
+            base_branch: "main:refs/heads/evil".into(),
+            ..request.clone()
+        };
+        assert!(
+            review_pr_fetch_command(
+                &git_binary,
+                &invalid,
+                remote.path().to_str().unwrap(),
+                false
+            )
+            .await
+            .is_err()
+        );
+        let missing = ReviewPrFetch {
+            number: 43,
+            ..request
+        };
+        let (mut command, refs) = review_pr_fetch_command(
+            &git_binary,
+            &missing,
+            remote.path().to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!command.output().await.unwrap().status.success());
+        assert!(
+            git_binary
+                .run(&["rev-parse", "--verify", &refs.base_ref])
+                .await
+                .is_err()
         );
     }
 }

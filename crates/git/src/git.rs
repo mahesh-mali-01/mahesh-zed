@@ -3,6 +3,7 @@ pub mod commit;
 mod hosting_provider;
 mod remote;
 pub mod repository;
+pub mod review;
 pub mod stash;
 pub mod status;
 
