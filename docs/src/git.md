@@ -335,6 +335,68 @@ These instructions are sent to the model in addition to any instruction files, s
 > Before Zed v1.4.0, this was done through the Rules Library, which has been removed.
 > See [Migrating from Rules](./ai/instructions.md#migrating-from-rules) for more information.
 
+## Pull Request Reviews
+
+Use {#action git::OpenPullRequests} in a local Git workspace to browse and review
+pull requests for its GitHub repository. The repository comes from the active
+workspace; open a pull request by number or URL, or select it from the list.
+
+Reviewing pull requests requires the [GitHub CLI](https://cli.github.com/) (`gh`)
+to be installed and authenticated for `github.com`. Zed uses the account selected
+by `gh` and checks the account and repository before publishing review changes.
+Run `gh auth status --hostname github.com` to inspect authentication. Git fetches
+also require access to the repository through its configured Git remote.
+
+This review workflow currently supports local repositories on `github.com`.
+Configuring a self-hosted provider for links does not enable pull request review
+on GitHub Enterprise, and remote-development projects are not yet supported by
+this workflow.
+
+### Conversation and Commits
+
+The Conversation tab shows the description, comments, reviews and file threads.
+More discussion entries load as you scroll. Replies appear inside their original
+thread. The Commits tab lists recent commits first and can open a commit in Zed.
+
+In Files changed, All commits opens the commit picker. Select commits to narrow
+the comparison, or clear the selection to return to the full pull request.
+Commit selection does not change the checked-out branch or rewrite commits.
+
+### Reviewing Files
+
+Files changed provides a searchable tree, split or unified diffs, and file and
+folder Viewed controls. Small pull requests can display all files together;
+large pull requests load a bounded window around the selected file and extend
+it as you navigate. Oversized previews are bounded to protect responsiveness.
+
+Marking a file Viewed updates its checkbox and progress immediately, then syncs
+with GitHub in the background. A pending indicator distinguishes local intent
+from confirmed delivery. Folder changes use the same background queue. The
+Unreviewed filter uses the same Viewed state as the counter and checkboxes.
+
+Refresh checks for new pull request data and synchronizes GitHub state.
+Retained reviewed contents are tracked separately from GitHub's Viewed flag:
+a file remaining Viewed on GitHub does not silently approve changed contents
+for local changes-since-review comparisons.
+
+### Comments and Delivery
+
+Select diff lines to compose an inline comment. Editing and replying use the
+existing thread card. Composer text is saved locally, and immediate posting
+publishes to GitHub without requiring a manually started pending review.
+Threads & review opens the optional discussion and review panel.
+
+Pending actions shows queued, failed or unconfirmed changes. A failed action
+provides recovery information. If delivery is uncertain, reconcile with GitHub
+before retrying to avoid duplicate comments. Changing accounts or advancing the
+pull request can require Refresh before a new write is permitted.
+
+Local review storage can include snapshots, retained source contents, drafts
+and delivery records. These belong to the current Zed profile and are not
+committed to the reviewed repository. Retained contents do not currently have
+an automatic expiration policy. Profile backups therefore also contain review
+data and should be treated like the source repositories they represent.
+
 ## Git Integrations
 
 Zed integrates with popular Git hosting services to ensure that Git commit hashes and references to Issues, Pull Requests, and Merge Requests become clickable links.

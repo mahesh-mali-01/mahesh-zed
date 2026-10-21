@@ -231,6 +231,7 @@
   - [Using Debuggers](./development/debuggers.md)
   - [Performance](./performance.md)
   - [UI/UX Checklist](./development/ui-checklist.md)
+  - [GitHub PR Review](./development/github-pr-review.md)
   - [Glossary](./development/glossary.md)
 - [Release Notes](./development/release-notes.md)
 - [Debugging Crashes](./development/debugging-crashes.md)
