@@ -118,6 +118,18 @@ impl Render for ReviewView {
                     visible_file_paths.len()
                 )
             });
+        let empty_message = empty_file_message(
+            total,
+            unreviewed,
+            !effective_data
+                .session
+                .presentation
+                .path_filter
+                .trim()
+                .is_empty(),
+            paths(&effective_data).len(),
+            visible_file_paths.len(),
+        );
         let previous_available = tree_navigation_target(&self.data, false).is_some();
         let next_available = tree_navigation_target(&self.data, true).is_some();
         let tree_width = self
@@ -293,11 +305,7 @@ impl Render for ReviewView {
         } else if self.busy {
             content = content.child(Label::new("Loading file…"));
         } else if self.error.is_none() && !self.data.session.presentation.since_review {
-            content = content.child(Label::new(if total == 0 {
-                "No committed differences"
-            } else {
-                "All files reviewed. Choose All files to revisit them."
-            }));
+            content = content.child(Label::new(empty_message));
         }
         v_flex()
             .size_full()
@@ -827,5 +835,28 @@ impl Render for ReviewView {
                         cx.listener(|this, _, window, cx| this.finish_tree_resize(window, cx)),
                     ),
             )
+    }
+}
+
+fn empty_file_message(
+    total: usize,
+    unreviewed_only: bool,
+    searching: bool,
+    matching_files: usize,
+    visible_files: usize,
+) -> &'static str {
+    if total == 0 {
+        "No committed differences"
+    } else if matching_files == 0 {
+        match (searching, unreviewed_only) {
+            (true, true) => "No unreviewed files match your search.",
+            (true, false) => "No files match your search.",
+            (false, true) => "All files reviewed. Choose All files to revisit them.",
+            (false, false) => "Select a file to review.",
+        }
+    } else if visible_files == 0 {
+        "Expand a folder to select a file."
+    } else {
+        "Select a file to review."
     }
 }
