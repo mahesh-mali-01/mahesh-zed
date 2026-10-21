@@ -391,7 +391,9 @@ impl SerializedPane {
 
             if let Some(item_handle) = item_handle {
                 pane.update_in(cx, |pane, window, cx| {
-                    pane.add_item(item_handle.clone(), true, true, None, window, cx);
+                    if pane.index_for_item(item_handle.as_ref()).is_none() {
+                        pane.add_item(item_handle.clone(), true, true, None, window, cx);
+                    }
                 })?;
             }
         }
@@ -410,14 +412,15 @@ impl SerializedPane {
             })?;
         }
 
-        // `items` keeps a `None` for every item that failed to deserialize, and those
-        // were never added to the pane. Counting them would leave the pinned count
-        // pointing past the pinned tabs and pin unpinned ones in their place.
+        // Failed slots and slots restored to the same entity do not add tabs.
+        // Count distinct surviving items in the original pinned prefix so that
+        // the pinned region cannot extend into the following unpinned tabs.
         let pinned_count = items
             .iter()
             .take(self.pinned_count)
-            .filter(|item| item.is_some())
-            .count();
+            .filter_map(|item| item.as_ref().map(|item| item.item_id()))
+            .collect::<IndexSet<_>>()
+            .len();
         pane.update(cx, |pane, _| {
             pane.set_pinned_count(pinned_count);
         })?;
@@ -490,5 +493,104 @@ impl Column for SerializedItem {
             },
             next_index,
         ))
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crate::{item::test::TestItem, register_serializable_item, tests::init_test};
+    use fs::FakeFs;
+    use gpui::{AppContext, Global, Task, TestAppContext};
+    use serde_json::json;
+
+    struct SharedRestoredItems(Vec<Entity<TestItem>>);
+    impl Global for SharedRestoredItems {}
+
+    #[gpui::test]
+    async fn duplicate_restored_items_preserve_pins_order_and_active_preview(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            register_serializable_item::<TestItem>(cx);
+            let items = (0..3).map(|_| cx.new(TestItem::new)).collect();
+            cx.set_global(SharedRestoredItems(items));
+            let mut descriptor = SerializableItemRegistry::descriptor("TestItem", cx).unwrap();
+            descriptor.deserialize = |_, _, _, item_id, _, cx| {
+                // Different serialized scopes can resolve to the same restored view.
+                let index = match item_id {
+                    1 | 4 => 0,
+                    2 => 1,
+                    3 => 2,
+                    _ => unreachable!(),
+                };
+                let item = cx.global::<SharedRestoredItems>().0[index].clone();
+                Task::ready(Ok(Box::new(item) as Box<dyn ItemHandle>))
+            };
+            cx.global_mut::<SerializableItemRegistry>()
+                .descriptors_by_kind
+                .insert(Arc::from("SharedTestItem"), descriptor);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "test.txt": "" })).await;
+        let project = Project::test(fs, ["root".as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        for with_intervening_pinned_item in [false, true] {
+            let mut children = vec![SerializedItem::new("SharedTestItem", 1, false, false)];
+            if with_intervening_pinned_item {
+                children.push(SerializedItem::new("SharedTestItem", 2, false, false));
+            }
+            children.push(SerializedItem::new("SharedTestItem", 4, true, false));
+            let pinned_count = children.len();
+            children.push(SerializedItem::new("SharedTestItem", 3, false, true));
+            let serialized = SerializedPane::new(children, true, pinned_count);
+            let (pane, task) = workspace.update_in(cx, |workspace, window, cx| {
+                let pane = workspace.add_pane(window, cx);
+                let weak_pane = pane.downgrade();
+                let project = workspace.project().clone();
+                let workspace = cx.entity().downgrade();
+                let task = window.spawn(cx, async move |cx| {
+                    serialized
+                        .deserialize_to(
+                            &project,
+                            &weak_pane,
+                            WorkspaceId::from_i64(1),
+                            workspace,
+                            cx,
+                        )
+                        .await
+                });
+                (pane, task)
+            });
+            let restored = task.await.unwrap();
+            pane.read_with(cx, |pane, _| {
+                let expected_ids = restored[..restored.len() - 1]
+                    .iter()
+                    .filter_map(|item| item.as_ref().map(|item| item.item_id()))
+                    .collect::<IndexSet<_>>();
+                assert_eq!(pane.pinned_count(), expected_ids.len());
+                assert_eq!(pane.items_len(), expected_ids.len() + 1);
+                assert_eq!(
+                    pane.items()
+                        .take(pane.pinned_count())
+                        .map(|item| item.item_id())
+                        .collect::<Vec<_>>(),
+                    expected_ids.into_iter().collect::<Vec<_>>(),
+                    "a later duplicate must not move the earlier pinned tab"
+                );
+                assert_eq!(
+                    pane.active_item_index(),
+                    0,
+                    "the duplicate active slot maps to the shared item"
+                );
+                assert_eq!(
+                    pane.preview_item_id(),
+                    restored.last().unwrap().as_ref().map(|item| item.item_id())
+                );
+            });
+        }
     }
 }

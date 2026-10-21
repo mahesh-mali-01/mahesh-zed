@@ -540,6 +540,7 @@ pub struct SplittableEditor {
     searched_side: Option<SplitSide>,
     /// The preferred diff style.
     diff_view_style: DiffViewStyle,
+    follow_global_diff_view_style: bool,
     /// True when the current width is below the minimum threshold for split
     /// mode, regardless of the current diff view style setting.
     too_narrow_for_split: bool,
@@ -576,6 +577,10 @@ impl SplittableEditor {
 
     pub fn diff_view_style(&self) -> DiffViewStyle {
         self.diff_view_style
+    }
+
+    pub fn set_follow_global_diff_view_style(&mut self, follow: bool) {
+        self.follow_global_diff_view_style = follow;
     }
 
     pub fn is_split(&self) -> bool {
@@ -657,9 +662,23 @@ impl SplittableEditor {
                     cx.emit(event.clone());
                 }
             }),
+            cx.on_release(|this, cx| {
+                // Inner editors can outlive the split view through deferred callbacks. Convert
+                // both anchors while both display maps still exist, before dropping either side.
+                if let Some(lhs) = &this.lhs {
+                    for editor in [&lhs.editor, &this.rhs_editor] {
+                        editor.update(cx, |editor, cx| {
+                            let snapshot =
+                                editor.display_map.update(cx, |map, cx| map.snapshot(cx));
+                            editor.scroll_manager.unshare_scroll_anchor(&snapshot, cx);
+                            editor.set_on_local_selections_changed(None);
+                        });
+                    }
+                }
+            }),
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let diff_view_style = EditorSettings::get_global(cx).diff_view_style;
-                if this.diff_view_style() != diff_view_style {
+                if this.follow_global_diff_view_style && this.diff_view_style() != diff_view_style {
                     this.toggle_split(&ToggleSplitDiff, window, cx);
                     cx.notify();
                 }
@@ -691,6 +710,7 @@ impl SplittableEditor {
         let split_state = cx.new(|cx| SplitEditorState::new(cx));
         Self {
             diff_view_style: style,
+            follow_global_diff_view_style: true,
             rhs_editor,
             rhs_multibuffer,
             lhs: None,
@@ -4476,6 +4496,78 @@ mod tests {
             lhs_pos.x, rhs_pos.x,
             "LHS should have same horizontal scroll position as RHS after autoscroll"
         )
+    }
+
+    #[gpui::test]
+    async fn test_retained_editor_scroll_anchor_after_split_release(cx: &mut gpui::TestAppContext) {
+        use multi_buffer::ToPoint as _;
+        use rope::Point;
+
+        for retain_left in [false, true] {
+            let (split_editor, mut cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+            let content = (0..50)
+                .map(|row| format!("line {row}\n"))
+                .collect::<String>();
+            let (buffer, diff) = buffer_with_diff(&content, &content, &mut cx);
+            split_editor.update(cx, |editor, cx| {
+                editor.update_excerpts_for_path(
+                    PathKey::sorted(0),
+                    buffer.clone(),
+                    vec![Point::new(0, 0)..buffer.read(cx).max_point()],
+                    0,
+                    diff.clone(),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+
+            let (retained, scrolling) = split_editor.read_with(cx, |editor, _| {
+                let left = editor
+                    .lhs
+                    .as_ref()
+                    .expect("split must exist")
+                    .editor
+                    .clone();
+                let right = editor.rhs_editor.clone();
+                if retain_left {
+                    (left, right)
+                } else {
+                    (right, left)
+                }
+            });
+            scrolling.update_in(cx, |editor, window, cx| {
+                editor.set_scroll_position(gpui::Point::new(0., 10.), window, cx);
+            });
+            let expected_start = retained.update(cx, |editor, cx| {
+                let snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
+                editor.multi_buffer_visible_range(&snapshot, cx).start
+            });
+            assert!(expected_start.row > 0);
+            let scrolling_display_map =
+                scrolling.read_with(cx, |editor, _| editor.display_map.downgrade());
+            cx.update(|_, _| {
+                drop(scrolling);
+                drop(split_editor);
+            });
+            cx.run_until_parked();
+            assert!(scrolling_display_map.upgrade().is_none());
+
+            retained.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
+                assert!(snapshot.companion_snapshot().is_none());
+                let anchor = editor.scroll_manager.native_anchor(&snapshot, cx);
+                assert_eq!(
+                    anchor.anchor.to_point(snapshot.buffer_snapshot()),
+                    expected_start
+                );
+                assert_eq!(
+                    editor.multi_buffer_visible_range(&snapshot, cx).start,
+                    expected_start
+                );
+                editor.settings_changed(window, cx);
+            });
+            cx.run_until_parked();
+        }
     }
 
     #[gpui::test]

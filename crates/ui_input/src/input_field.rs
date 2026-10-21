@@ -33,6 +33,8 @@ pub struct InputField {
     ///
     /// For example, a magnifying glass icon in a search field.
     start_icon: Option<IconName>,
+    clear_button: bool,
+    clear_subscription: Option<gpui::Subscription>,
     /// The minimum width of for the input
     min_width: Length,
     /// The tab index for keyboard navigation order.
@@ -66,6 +68,8 @@ impl InputField {
             placeholder: SharedString::new(placeholder_text),
             editor,
             start_icon: None,
+            clear_button: false,
+            clear_subscription: None,
             min_width: px(192.).into(),
             tab_index: None,
             tab_stop: true,
@@ -76,6 +80,11 @@ impl InputField {
 
     pub fn start_icon(mut self, icon: IconName) -> Self {
         self.start_icon = Some(icon);
+        self
+    }
+
+    pub fn clear_button(mut self, enabled: bool) -> Self {
+        self.clear_button = enabled;
         self
     }
 
@@ -146,6 +155,20 @@ impl InputField {
 impl Render for InputField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.editor.clone();
+        if self.clear_button && self.clear_subscription.is_none() {
+            let weak = cx.entity().downgrade();
+            self.clear_subscription = Some(editor.subscribe(
+                Box::new(move |event, _, cx| {
+                    if event == crate::ErasedEditorEvent::BufferEdited {
+                        if let Some(input) = weak.upgrade() {
+                            input.update(cx, |_, cx| cx.notify());
+                        }
+                    }
+                }),
+                window,
+                cx,
+            ));
+        }
 
         if let Some(masked) = self.masked {
             self.editor.set_masked(masked, window, cx);
@@ -203,6 +226,17 @@ impl Render for InputField {
                             .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                     })
                     .child(self.editor.render(window, cx))
+                    .when(self.clear_button && !self.is_empty(cx), |this| {
+                        this.child(
+                            IconButton::new("clear-input", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Clear search"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.clear(window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when_some(self.masked, |this, is_masked| {
                         this.child(
                             IconButton::new(
