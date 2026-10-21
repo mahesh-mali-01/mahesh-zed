@@ -1666,6 +1666,7 @@
       "ctrl-shift-c": "zed::OpenWorktreeSetupTasks",
     },
   },
+  // ReviewView navigation overrides editor bindings in specific-overrides.json.
   {
     "context": "GitGraph",
     "bindings": {

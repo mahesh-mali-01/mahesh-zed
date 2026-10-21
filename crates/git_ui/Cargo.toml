@@ -16,6 +16,8 @@ doctest = false
 [features]
 test-support = ["multi_buffer/test-support", "remote_connection/test-support"]
 call = ["dep:call"]
+# Explicit opt-in for offline native review fault-injection fixtures.
+review-test-support = []
 
 [dependencies]
 agent_settings.workspace = true
@@ -26,6 +28,7 @@ buffer_diff.workspace = true
 call = { workspace = true, optional = true }
 client.workspace = true
 collections.workspace = true
+command_palette_hooks.workspace = true
 component.workspace = true
 db.workspace = true
 editor.workspace = true
@@ -54,6 +57,8 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 smallvec.workspace = true
 strum.workspace = true
 sysinfo.workspace = true
@@ -75,6 +80,7 @@ zed_actions.workspace = true
 ztracing.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 ctor.workspace = true
 db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }

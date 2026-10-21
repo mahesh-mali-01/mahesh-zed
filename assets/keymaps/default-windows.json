@@ -1678,6 +1678,7 @@
       "escape": "notebook::EnterCommandMode",
     },
   },
+  // ReviewView navigation overrides editor bindings in specific-overrides.json.
   {
     "context": "GitGraph",
     "bindings": {

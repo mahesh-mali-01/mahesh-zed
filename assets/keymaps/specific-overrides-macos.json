@@ -7,6 +7,24 @@
 // keymaps, giving it the highest precedence of all the bindings set by us.
 [
   {
+    "context": "ReviewView",
+    "bindings": {
+      "alt-down": "git::NextReviewFile",
+      "alt-up": "git::PreviousReviewFile",
+      "alt-v": "git::ToggleReviewViewed",
+      "alt-u": "git::ToggleUnreviewedFiles",
+    },
+  },
+  {
+    "context": "ReviewView > Editor",
+    "bindings": {
+      "alt-down": "git::NextReviewFile",
+      "alt-up": "git::PreviousReviewFile",
+      "alt-v": "git::ToggleReviewViewed",
+      "alt-u": "git::ToggleUnreviewedFiles",
+    },
+  },
+  {
     "context": "Picker > Editor",
     "use_key_equivalents": true,
     "bindings": {

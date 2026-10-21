@@ -154,6 +154,26 @@ pub(crate) fn commit_context_menu(
                     );
                 })
             })
+            .entry("Review commits from here…", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    if let Some(repository) = repository.as_ref().and_then(WeakEntity::upgrade) {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                crate::review_view::ReviewView::pick_commits(
+                                    workspace,
+                                    repository,
+                                    None,
+                                    Some(sha),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .log_err();
+                    }
+                }
+            })
             .map(|mut menu| {
                 menu = menu.separator().header("Custom Commands");
 

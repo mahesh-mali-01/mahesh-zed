@@ -1111,15 +1111,43 @@ impl language::File for GitBlob {
     }
 }
 
+pub(crate) fn validate_review_text(text: &str) -> Result<()> {
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_LINES: usize = 100_000;
+    const MAX_LINE_BYTES: usize = 16 * 1024;
+
+    anyhow::ensure!(
+        text.len() <= MAX_BYTES,
+        "This file is too large to render safely (8 MiB per side). Open it externally or choose another file; review progress is unchanged."
+    );
+    let mut line_count = 0;
+    for line in text.split('\n') {
+        line_count += 1;
+        anyhow::ensure!(
+            line_count <= MAX_LINES,
+            "This file has too many lines to render safely (100,000 per side). Open it externally or choose another file; review progress is unchanged."
+        );
+        anyhow::ensure!(
+            line.len() <= MAX_LINE_BYTES,
+            "This file contains a very long line (over 16 KiB). Open it externally or choose another file; review progress is unchanged."
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn build_buffer(
     mut text: String,
     blob: Arc<dyn File>,
     language_registry: &Arc<language::LanguageRegistry>,
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<Buffer>> {
-    let line_ending = LineEnding::detect(&text);
-    LineEnding::normalize(&mut text);
-    let text = Rope::from(text);
+    let (line_ending, text) = cx
+        .background_spawn(async move {
+            let line_ending = LineEnding::detect(&text);
+            LineEnding::normalize(&mut text);
+            (line_ending, Rope::from(text))
+        })
+        .await;
     let language =
         cx.update(|_, cx| language_registry.language_for_file(&blob, Some(&text), cx))?;
     let language = if let Some(language_id) = language {
@@ -1146,15 +1174,20 @@ pub(crate) async fn build_buffer(
     Ok(buffer)
 }
 
-async fn build_buffer_diff(
-    mut old_text: Option<String>,
+pub(crate) async fn build_buffer_diff(
+    old_text: Option<String>,
     buffer: &Entity<Buffer>,
     language_registry: &Arc<LanguageRegistry>,
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<BufferDiff>> {
-    if let Some(old_text) = &mut old_text {
-        LineEnding::normalize(old_text);
-    }
+    let old_text = cx
+        .background_spawn(async move {
+            old_text.map(|mut text| {
+                LineEnding::normalize(&mut text);
+                Arc::<str>::from(text)
+            })
+        })
+        .await;
 
     let language = cx.update(|_, cx| buffer.read(cx).language().cloned())?;
     let buffer = cx.update(|_, cx| buffer.read(cx).snapshot())?;
@@ -1163,11 +1196,7 @@ async fn build_buffer_diff(
         cx.new(|cx| BufferDiff::new(&buffer.text, language, Some(language_registry.clone()), cx));
 
     diff.update(cx, |diff, cx| {
-        diff.set_base_text(
-            old_text.map(|old_text| Arc::from(old_text.as_str())),
-            buffer.text.clone(),
-            cx,
-        )
+        diff.set_base_text(old_text, buffer.text.clone(), cx)
     })
     .await;
 
@@ -1538,6 +1567,19 @@ mod tests {
     use indoc::indoc;
     use language::{Language, LanguageConfig, LanguageMatcher, markdown_lang};
     use settings::SettingsStore;
+
+    #[test]
+    fn review_text_render_budget_handles_independent_limits() {
+        assert!(validate_review_text("").is_ok());
+        assert!(validate_review_text(&"x".repeat(16 * 1024)).is_ok());
+        assert!(validate_review_text(&"x".repeat(16 * 1024 + 1)).is_err());
+        assert!(validate_review_text(&"\n".repeat(99_999)).is_ok());
+        assert!(validate_review_text(&"\n".repeat(100_000)).is_err());
+        let at_byte_limit = "x".repeat(8191) + "\n";
+        let at_byte_limit = at_byte_limit.repeat(1024);
+        assert!(validate_review_text(&at_byte_limit).is_ok());
+        assert!(validate_review_text(&(at_byte_limit + "x")).is_err());
+    }
 
     #[gpui::test]
     async fn test_build_buffer_resolves_injected_languages(cx: &mut TestAppContext) {

@@ -49,11 +49,22 @@ pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
+pub mod github_pull_requests;
+pub mod github_review;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
+pub mod pull_request_view;
 pub(crate) mod remote_output;
 pub mod repository_selector;
+pub mod review;
+mod review_comment_anchor;
+mod review_commit_picker;
+mod review_github_view;
+pub mod review_github_viewed;
+mod review_outbox_runtime;
+pub mod review_store;
+pub mod review_view;
 pub mod solo_diff_view;
 pub mod staged_diff;
 pub mod stash_picker;
@@ -64,6 +75,7 @@ pub use blame_ui::GitBlameStatus;
 pub use conflict_view::MergeConflictIndicator;
 
 pub fn init(cx: &mut App) {
+    init_review_command_visibility(cx);
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     git_graph::init(cx);
@@ -112,6 +124,8 @@ pub fn init(cx: &mut App) {
         staged_diff::StagedDiff::register(workspace, cx);
         unstaged_diff::UnstagedDiff::register(workspace, cx);
         branch_diff::BranchDiff::register(workspace, cx);
+        review_view::ReviewView::register(workspace, cx);
+        pull_request_view::PullRequestView::register(workspace, cx);
         CommitModal::register(workspace);
         git_panel::register(workspace);
         repository_selector::register(workspace);
@@ -1709,5 +1723,54 @@ mod view_commit_tests {
             })
             .expect("fake git state should exist");
         assert_eq!(tagged_commit, Some(selected_commit.to_string()));
+    }
+}
+
+fn init_review_command_visibility(cx: &mut App) {
+    // Keep one discoverable PR entry point. These actions remain dispatchable
+    // by native controls/tests and existing keybindings, but are not competing
+    // user-facing workflows in the command palette.
+    command_palette_hooks::CommandPaletteFilter::update_global(cx, |filter, _| {
+        use std::any::TypeId;
+        filter.hide_action_types(&[
+            TypeId::of::<pull_request_view::ReviewPullRequestFiles>(),
+            TypeId::of::<pull_request_view::PreviewPullRequestReview>(),
+            TypeId::of::<pull_request_view::PreviewReviewCommitPicker>(),
+            TypeId::of::<pull_request_view::PreviewReviewComments>(),
+            TypeId::of::<review_view::PreviewReviewViewedFaults>(),
+            TypeId::of::<review_view::OpenReview>(),
+            TypeId::of::<review_view::OpenDirectReview>(),
+            TypeId::of::<review_view::OpenCommitReview>(),
+        ]);
+    });
+}
+
+#[cfg(test)]
+mod review_command_tests {
+    use super::*;
+    #[gpui::test]
+    fn only_pull_requests_is_a_palette_entry(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            command_palette_hooks::init(cx);
+            init_review_command_visibility(cx);
+            let filter = command_palette_hooks::CommandPaletteFilter::try_global(cx).unwrap();
+            assert!(!filter.is_hidden(&pull_request_view::OpenPullRequests));
+            for action in [
+                &pull_request_view::ReviewPullRequestFiles as &dyn gpui::Action,
+                &pull_request_view::PreviewPullRequestReview,
+                &pull_request_view::PreviewReviewCommitPicker,
+                &pull_request_view::PreviewReviewComments,
+                &review_view::PreviewReviewViewedFaults,
+                &review_view::OpenReview,
+                &review_view::OpenDirectReview,
+                &review_view::OpenCommitReview,
+            ] {
+                assert!(
+                    filter.is_hidden(action),
+                    "{} must stay internal",
+                    action.name()
+                );
+            }
+        });
     }
 }

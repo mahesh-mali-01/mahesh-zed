@@ -1757,6 +1757,7 @@
       "escape": "notebook::EnterCommandMode",
     },
   },
+  // ReviewView navigation overrides editor bindings in specific-overrides-macos.json.
   {
     "context": "GitGraph",
     "bindings": {

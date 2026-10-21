@@ -449,6 +449,19 @@ impl BranchList {
         })
     }
 
+    pub(crate) fn with_selection_prompt(
+        self,
+        prompt: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        self.picker.update(cx, |picker, cx| {
+            picker.delegate.selection_prompt = Some(prompt.into());
+            picker.refresh_placeholder(window, cx);
+        });
+        self
+    }
+
     pub(crate) fn set_branch_filter(
         &mut self,
         branch_filter: BranchFilter,
@@ -676,6 +689,7 @@ pub struct BranchListDelegate {
     show_footer: bool,
     hovered_delete_index: Option<usize>,
     remote_provider_icons: HashMap<String, IconName>,
+    selection_prompt: Option<Arc<str>>,
 }
 
 enum BranchSelectionBehavior {
@@ -1030,6 +1044,7 @@ impl BranchListDelegate {
             show_footer: false,
             hovered_delete_index: None,
             remote_provider_icons: HashMap::default(),
+            selection_prompt: None,
         }
     }
 
@@ -1256,6 +1271,9 @@ impl PickerDelegate for BranchListDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        if let Some(prompt) = &self.selection_prompt {
+            return prompt.clone();
+        }
         match self.state {
             PickerState::List | PickerState::NewRemote | PickerState::NewBranch => {
                 "Switch or type to create a branch…"
