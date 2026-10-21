@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Check an exact Git range before publication without printing matched content.
+
+Unchanged blobs already reachable from the trusted base are exempt, including
+upstream credential-shaped fixtures. Newly reachable blobs and commits are scanned
+in full. Every historical feature tree and the final tracked tree are checked for
+private evidence paths; final-tree blobs absent from base are scanned as well.
+No refs, files, configuration, or Git objects are modified.
+"""
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+
+
+class CheckError(Exception):
+    pass
+
+
+def git(*arguments):
+    result = subprocess.run(
+        ["git", "--no-replace-objects", *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    if result.returncode:
+        # Git diagnostics can contain credentials or private remote paths.
+        raise CheckError("Git object or reference validation failed")
+    return result.stdout
+
+
+def resolve(reference):
+    return git("rev-parse", "--verify", "--end-of-options", reference + "^{commit}").strip().decode("ascii")
+
+
+def rules_from_file(filename):
+    rules = [
+        ("private-key", rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"),
+        ("github-token", rb"\b(?:gh[pousr]_[A-Za-z0-9]{30,255}|github_pat_[A-Za-z0-9_]{50,255})\b"),
+        ("aws-access-key", rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+        ("slack-token", rb"\bxox[baprs]-[A-Za-z0-9-]{20,255}\b"),
+    ]
+    if filename:
+        try:
+            with open(filename, encoding="utf-8") as source:
+                external = json.load(source)
+            if not isinstance(external, list):
+                raise ValueError()
+            for index, rule in enumerate(external):
+                if not isinstance(rule, dict) or set(rule) != {"name", "pattern"}:
+                    raise ValueError()
+                if not all(isinstance(rule[key], str) and rule[key] for key in rule):
+                    raise ValueError()
+                # Never echo a user-supplied name: it too may contain private data.
+                rules.append((f"external-{index + 1}", rule["pattern"].encode("utf-8")))
+        except (OSError, UnicodeError, ValueError, TypeError):
+            raise CheckError("Invalid external denylist") from None
+    try:
+        return [(name, re.compile(pattern, re.IGNORECASE)) for name, pattern in rules]
+    except re.error:
+        raise CheckError("Invalid external denylist pattern") from None
+
+
+def redact_allowed_identity_headers(raw, allowed_emails):
+    headers, separator, body = raw.partition(b"\n\n")
+    lines = []
+    for line in headers.split(b"\n"):
+        if line.startswith((b"author ", b"committer ")):
+            match = re.fullmatch(rb"((?:author|committer) .* <)([^<>\n]+)(> -?\d+ [+-]\d{4})", line)
+            if match and match[2] in allowed_emails:
+                line = match[1] + b"[allowed identity]" + match[3]
+        lines.append(line)
+    return b"\n".join(lines) + separator + body
+
+
+def tree_entries(commit):
+    for record in git("ls-tree", "-rz", "--full-tree", commit).split(b"\0"):
+        if record:
+            metadata, path = record.split(b"\t", 1)
+            _, kind, object_id = metadata.split(b" ")
+            yield kind, object_id.decode("ascii"), path
+
+
+def reachable_objects(head, base=None):
+    arguments = ["rev-list", "--objects", "--no-object-names", head]
+    if base:
+        arguments.append("^" + base)
+    return set(git(*arguments).decode("ascii").splitlines())
+
+
+def check(base, head, rules, allowed_emails):
+    base, head = resolve(base), resolve(head)
+    if subprocess.run(
+        ["git", "--no-replace-objects", "merge-base", "--is-ancestor", base, head],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode:
+        raise CheckError("Base must be an ancestor of head")
+    findings = set()
+
+    def scan(raw, location):
+        for name, pattern in rules:
+            if pattern.search(raw):
+                findings.add((name, location))
+
+    new_objects = reachable_objects(head, base)
+    commits = git("rev-list", head, "^" + base).decode("ascii").splitlines()
+    blobs = set()
+    for object_id in sorted(new_objects):
+        kind = git("cat-file", "-t", object_id).strip()
+        if kind == b"commit":
+            raw = git("cat-file", "commit", object_id)
+            scan(redact_allowed_identity_headers(raw, allowed_emails), "commit:" + object_id)
+        elif kind == b"blob":
+            blobs.add(object_id)
+    # Walk each commit's tree: rev-list only retains one name per object, so it
+    # cannot establish that historical aliases or deleted evidence paths are safe.
+    for commit in set(commits + [head]):
+        for kind, object_id, path in tree_entries(commit):
+            path_identity = "path-sha256:" + hashlib.sha256(path).hexdigest()
+            if b".local" in path.split(b"/"):
+                findings.add(("private-evidence-path", path_identity))
+            scan(path, path_identity)
+            if commit == head and kind == b"blob" and object_id in new_objects:
+                blobs.add(object_id)
+    for object_id in sorted(blobs):
+        scan(git("cat-file", "blob", object_id), "blob:" + object_id)
+    return sorted(findings), len(commits), len(blobs)
+
+
+def main(arguments=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", required=True)
+    parser.add_argument("--head", required=True)
+    parser.add_argument("--denylist", help="External JSON list of name/pattern regex rules")
+    parser.add_argument("--allow-email", action="append", default=[], help="Exact author/committer email exemption only")
+    options = parser.parse_args(arguments)
+    try:
+        findings, commits, blobs = check(
+            options.base, options.head, rules_from_file(options.denylist),
+            {email.encode("utf-8") for email in options.allow_email},
+        )
+    except CheckError as error:
+        print(f"Publication check failed: {error}", file=sys.stderr)
+        return 2
+    except (OSError, UnicodeError):
+        print("Publication check failed: could not read publication inputs", file=sys.stderr)
+        return 2
+    for rule, location in findings:
+        print(f"Rejected: rule={rule} object={location}")
+    if findings:
+        print(f"Publication check rejected {len(findings)} findings")
+        return 1
+    print(f"Publication check passed: {commits} commits, {blobs} blobs; trusted-base blobs exempt")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
