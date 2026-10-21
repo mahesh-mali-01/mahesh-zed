@@ -587,6 +587,7 @@ impl PullRequestView {
         }
     }
 
+    #[cfg(any(test, feature = "review-test-support"))]
     fn install_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.viewer = Some(GitHubUser {
             node_id: None,

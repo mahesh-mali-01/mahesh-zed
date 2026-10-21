@@ -206,6 +206,7 @@ impl Focusable for ReviewCommitPicker {
     }
 }
 impl ReviewCommitPicker {
+    #[cfg(any(test, feature = "review-test-support"))]
     pub(crate) fn preview(
         workspace: WeakEntity<Workspace>,
         repository: Entity<Repository>,
