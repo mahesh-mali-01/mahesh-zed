@@ -187,6 +187,35 @@ impl Default for ParseHtmlNodeContext {
     }
 }
 
+/// Attributes of an inline HTML token, decoded by the same HTML parser as blocks.
+/// This only reads a DOM; it does not load resources or execute HTML.
+pub(crate) fn inline_html_attributes(source: &str, tag: &str) -> Option<HashMap<String, String>> {
+    let mut cursor = std::io::Cursor::new(source.as_bytes());
+    let dom = super::parse_html(&mut cursor).ok()?;
+    // RcDom's Node::drop drains descendant children even when other handles
+    // remain. Keep the document alive until traversal has copied the attributes.
+    let mut pending = vec![dom.document.clone()];
+    let attributes = loop {
+        let Some(node) = pending.pop() else {
+            break None;
+        };
+        if let NodeData::Element { name, attrs, .. } = &node.data
+            && name.local.as_ref() == tag
+        {
+            break Some(
+                attrs
+                    .borrow()
+                    .iter()
+                    .map(|attr| (attr.name.local.to_string(), attr.value.to_string()))
+                    .collect(),
+            );
+        }
+        pending.extend(node.children.borrow().iter().cloned());
+    };
+    drop(dom);
+    attributes
+}
+
 pub(crate) fn parse_html_block(
     source: &str,
     source_range: Range<usize>,
@@ -803,6 +832,34 @@ fn extract_html_table(node: &Node, source_range: Range<usize>) -> Option<ParsedH
 mod tests {
     use super::*;
     use gpui::TextAlign;
+
+    #[test]
+    fn inline_attributes_keep_document_alive_through_descendant_traversal() {
+        for (source, tag, key, expected) in [
+            (
+                "<a href='https://example.com?a=1&amp;b=2'>",
+                "a",
+                "href",
+                "https://example.com?a=1&b=2",
+            ),
+            (
+                "<span><a href='https://example.com/nested'>text</a></span>",
+                "a",
+                "href",
+                "https://example.com/nested",
+            ),
+            (
+                "<img src='image.png' alt='example'>",
+                "img",
+                "src",
+                "image.png",
+            ),
+        ] {
+            let attributes = inline_html_attributes(source, tag).unwrap();
+            assert_eq!(attributes.get(key).map(String::as_str), Some(expected));
+        }
+        assert!(inline_html_attributes("<span>text</span>", "a").is_none());
+    }
 
     #[test]
     fn parses_html_styled_text() {

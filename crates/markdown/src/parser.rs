@@ -286,6 +286,9 @@ pub(crate) fn parse_markdown_with_options(
     let mut html_blocks = BTreeMap::default();
     let mut metadata_blocks = BTreeMap::default();
     let mut within_link = false;
+    let mut inline_html_anchors: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut deferred_inline_html_close: Option<(usize, usize)> = None;
+    let mut suppressed_markdown_links = 0usize;
     let mut within_code_block = false;
     let mut within_metadata = false;
     let mut within_table = false;
@@ -372,6 +375,15 @@ pub(crate) fn parse_markdown_with_options(
                         title,
                         id,
                     } => {
+                        // HTML anchors cannot contain another clickable link.
+                        // Keep the nested Markdown label, without a nested link
+                        // style/hit-test stack or changing the outer link state.
+                        if inline_html_anchors.iter().any(Option::is_some)
+                            || deferred_inline_html_close.is_some()
+                        {
+                            suppressed_markdown_links += 1;
+                            continue;
+                        }
                         within_link = true;
                         MarkdownTag::Link {
                             link_type,
@@ -507,6 +519,55 @@ pub(crate) fn parse_markdown_with_options(
                 state.push_event(range, MarkdownEvent::Start(tag))
             }
             pulldown_cmark::Event::End(tag) => {
+                if tag == MarkdownTagEnd::Link && suppressed_markdown_links > 0 {
+                    suppressed_markdown_links -= 1;
+                    continue;
+                }
+                if matches!(
+                    tag,
+                    MarkdownTagEnd::Emphasis
+                        | MarkdownTagEnd::Strong
+                        | MarkdownTagEnd::Strikethrough
+                        | MarkdownTagEnd::Superscript
+                        | MarkdownTagEnd::Subscript
+                ) && let Some(anchor) = inline_html_anchors
+                    .iter_mut()
+                    .rev()
+                    .find(|anchor| anchor.is_some())
+                    && let Some((start_event, depth)) = *anchor
+                    && state.depth == depth
+                {
+                    // An HTML anchor opened inside Markdown formatting cannot
+                    // outlive that enclosing style. Keep its placeholder so a
+                    // later </a> cannot close an unrelated Markdown link.
+                    state.events[start_event].0.end = range.end;
+                    state.push_event(
+                        range.end..range.end,
+                        MarkdownEvent::End(MarkdownTagEnd::Link),
+                    );
+                    *anchor = None;
+                    within_link = false;
+                }
+                if matches!(
+                    tag,
+                    MarkdownTagEnd::Paragraph
+                        | MarkdownTagEnd::Heading(_)
+                        | MarkdownTagEnd::Item
+                        | MarkdownTagEnd::TableCell
+                ) {
+                    while let Some(opened) = inline_html_anchors.pop() {
+                        if let Some((start_event, _)) = opened {
+                            // Link hit testing uses the Start event's source
+                            // range, which must include its visible body.
+                            state.events[start_event].0.end = range.end;
+                            state.push_event(
+                                range.end..range.end,
+                                MarkdownEvent::End(MarkdownTagEnd::Link),
+                            );
+                            within_link = false;
+                        }
+                    }
+                }
                 if let pulldown_cmark::TagEnd::Link = tag {
                     within_link = false;
                 } else if let pulldown_cmark::TagEnd::CodeBlock = tag {
@@ -533,7 +594,18 @@ pub(crate) fn parse_markdown_with_options(
                 } else if let pulldown_cmark::TagEnd::Table = tag {
                     within_table = false;
                 }
-                state.push_event(range, MarkdownEvent::End(tag));
+                state.push_event(range.clone(), MarkdownEvent::End(tag));
+                if let Some((start_event, depth)) = deferred_inline_html_close
+                    && state.depth == depth
+                {
+                    state.events[start_event].0.end = range.end;
+                    state.push_event(
+                        range.end..range.end,
+                        MarkdownEvent::End(MarkdownTagEnd::Link),
+                    );
+                    deferred_inline_html_close = None;
+                    within_link = false;
+                }
             }
             pulldown_cmark::Event::Text(parsed) => {
                 fn event_for(
@@ -580,13 +652,9 @@ pub(crate) fn parse_markdown_with_options(
                     parsed,
                 }];
 
-                while match parser.peek() {
-                    Some((pulldown_cmark::Event::Text(_), _)) => true,
-                    Some((pulldown_cmark::Event::InlineHtml(html), _)) => {
-                        parse_html && !is_br_tag(html)
-                    }
-                    _ => false,
-                } {
+                // HTML tokens must reach their own handler. Consuming them here
+                // used to discard closing anchors and images following plain text.
+                while matches!(parser.peek(), Some((pulldown_cmark::Event::Text(_), _))) {
                     let Some((next_event, next_range)) = parser.next() else {
                         unreachable!()
                     };
@@ -715,11 +783,82 @@ pub(crate) fn parse_markdown_with_options(
             }
             pulldown_cmark::Event::Html(_) => state.push_event(range, MarkdownEvent::Html),
             pulldown_cmark::Event::InlineHtml(html) => {
-                if parse_html && is_br_tag(&html) {
-                    state.push_event(range, MarkdownEvent::HardBreak)
-                } else {
-                    state.push_event(range, MarkdownEvent::InlineHtml)
+                if !parse_html {
+                    state.push_event(range, MarkdownEvent::InlineHtml);
+                    continue;
                 }
+                if is_br_tag(&html) {
+                    state.push_event(range, MarkdownEvent::HardBreak);
+                    continue;
+                }
+                let token = html.trim().trim_start_matches('<');
+                let closing = token.starts_with('/');
+                let token = token.trim_start_matches('/');
+                let tag = token
+                    .split(|ch: char| ch.is_ascii_whitespace() || ch == '>' || ch == '/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if tag == "code" {
+                    // Keep the existing inline-code styling handler, including
+                    // literal HTML inside Markdown code spans/blocks.
+                    state.push_event(range, MarkdownEvent::InlineHtml);
+                } else if tag == "a" && closing {
+                    if let Some((start_event, depth)) = inline_html_anchors.pop().flatten() {
+                        if state.depth == depth {
+                            state.events[start_event].0.end = range.end;
+                            state.push_event(range, MarkdownEvent::End(MarkdownTagEnd::Link));
+                            within_link = false;
+                        } else {
+                            // Malformed mixed markup can close an HTML anchor
+                            // inside Markdown emphasis. Finish that inline
+                            // formatting first so native style stacks stay balanced.
+                            deferred_inline_html_close = Some((start_event, depth));
+                        }
+                    }
+                } else if tag == "a" {
+                    let attrs =
+                        html::html_parser::inline_html_attributes(&html, "a").unwrap_or_default();
+                    let opened = !within_link && attrs.contains_key("href");
+                    if opened {
+                        within_link = true;
+                        state.push_event(
+                            range,
+                            MarkdownEvent::Start(MarkdownTag::Link {
+                                link_type: LinkType::Inline,
+                                dest_url: attrs.get("href").cloned().unwrap_or_default().into(),
+                                title: attrs.get("title").cloned().unwrap_or_default().into(),
+                                id: SharedString::default(),
+                            }),
+                        );
+                        inline_html_anchors.push(Some((state.events.len() - 1, state.depth)));
+                    } else {
+                        inline_html_anchors.push(None);
+                    }
+                } else if tag == "img" && !closing {
+                    let attrs =
+                        html::html_parser::inline_html_attributes(&html, "img").unwrap_or_default();
+                    if let Some(src) = attrs.get("src") {
+                        state.push_event(
+                            range.clone(),
+                            MarkdownEvent::Start(MarkdownTag::Image {
+                                link_type: LinkType::Inline,
+                                dest_url: src.clone().into(),
+                                title: attrs.get("title").cloned().unwrap_or_default().into(),
+                                id: SharedString::default(),
+                            }),
+                        );
+                        state.push_event(
+                            range.clone(),
+                            MarkdownEvent::SubstitutedText(
+                                attrs.get("alt").cloned().unwrap_or_default(),
+                            ),
+                        );
+                        state.push_event(range, MarkdownEvent::End(MarkdownTagEnd::Image));
+                    }
+                }
+                // Other HTML wrappers are not literal text in HTML-enabled
+                // documents. Their body remains separate Markdown events.
             }
             pulldown_cmark::Event::FootnoteReference(label) => state.push_event(
                 range,
@@ -2083,5 +2222,198 @@ mod tests {
                 "unrecognized inline HTML \"{input}\" should not emit HardBreak"
             );
         }
+    }
+    #[test]
+    fn inline_html_preserves_linked_image_and_markdown_body() {
+        let source = r#"<a href="https://example.com/report?a=1&amp;b=2"><img src="https://example.com/badge.png" alt="Build status"></a> **Title** and <a href='https://example.com/details'>details</a>."#;
+        let parsed = parse_markdown_with_options(source, true, false, false);
+        let links: Vec<_> = parsed
+            .events
+            .iter()
+            .filter_map(|(_, event)| {
+                if let MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) = event {
+                    Some(dest_url.as_ref())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            links,
+            [
+                "https://example.com/report?a=1&b=2",
+                "https://example.com/details"
+            ]
+        );
+        assert_eq!(
+            parsed
+                .events
+                .iter()
+                .filter(|(_, event)| matches!(event, MarkdownEvent::End(MarkdownTagEnd::Link)))
+                .count(),
+            2
+        );
+        assert!(parsed.events.iter().any(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::Image { dest_url, .. }) if dest_url.as_ref() == "https://example.com/badge.png")));
+        assert!(parsed.events.iter().any(|(_, event)| matches!(event, MarkdownEvent::SubstitutedText(alt) if alt == "Build status")));
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::Strong)))
+        );
+        assert!(
+            !parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, MarkdownEvent::InlineHtml))
+        );
+        let visible = parsed
+            .events
+            .iter()
+            .filter_map(|(range, event)| match event {
+                MarkdownEvent::Text => Some(source[range.clone()].to_string()),
+                MarkdownEvent::SubstitutedText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(visible, "Build status Title and details.");
+    }
+
+    #[test]
+    fn inline_html_after_plain_text_and_unclosed_anchor_remain_balanced() {
+        let source = "Before <a href='https://example.com'>linked **body**</a> after.\n\n<a href='https://example.com/open'>open\n\nNext paragraph.";
+        let parsed = parse_markdown_with_options(source, true, false, false);
+        let starts = parsed
+            .events
+            .iter()
+            .filter(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::Link { .. })))
+            .count();
+        let ends = parsed
+            .events
+            .iter()
+            .filter(|(_, event)| matches!(event, MarkdownEvent::End(MarkdownTagEnd::Link)))
+            .count();
+        assert_eq!((starts, ends), (2, 2));
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::Strong)))
+        );
+    }
+
+    #[test]
+    fn inline_html_options_preserve_literal_and_markdown_code_examples() {
+        let source = "<a href='https://example.com'>literal</a>";
+        let literal = parse_markdown_with_options(source, false, false, false);
+        assert!(
+            literal
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, MarkdownEvent::InlineHtml))
+        );
+        assert!(
+            !literal
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::Link { .. })))
+        );
+        let code = "`<a href='https://example.com'>literal</a>`\n\n```html\n<img src='https://example.com/image.png'>\n```";
+        let parsed = parse_markdown_with_options(code, true, false, false);
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, MarkdownEvent::Code))
+        );
+        assert!(!parsed.events.iter().any(|(_, event)| matches!(
+            event,
+            MarkdownEvent::Start(MarkdownTag::Link { .. } | MarkdownTag::Image { .. })
+        )));
+    }
+    #[test]
+    fn inline_html_link_source_ranges_cover_clickable_body() {
+        let source = "Before <a href='https://example.com/matched'>linked **body**</a> after.\n\n<a href='https://example.com/open'>unclosed body\n\nNext paragraph.";
+        let parsed = parse_markdown_with_options(source, true, false, false);
+        let links: Vec<_> = parsed
+            .events
+            .iter()
+            .filter_map(|(range, event)| {
+                matches!(event, MarkdownEvent::Start(MarkdownTag::Link { .. })).then_some(range)
+            })
+            .collect();
+        assert_eq!(links.len(), 2);
+        let body_index = source.find("linked").unwrap();
+        assert!(links[0].contains(&body_index));
+        assert!(links[0].contains(&source.find("body**").unwrap()));
+        assert_eq!(
+            &source[links[0].clone()],
+            "<a href='https://example.com/matched'>linked **body**</a>"
+        );
+        assert!(!links[0].contains(&source.find("after.").unwrap()));
+        assert!(links[1].contains(&source.find("unclosed body").unwrap()));
+        assert!(!links[1].contains(&source.find("Next paragraph.").unwrap()));
+    }
+    #[test]
+    fn inline_html_anchor_suppresses_nested_markdown_links_and_balances_styles() {
+        for source in [
+            "<a href='https://example.com/outer'>[label](https://example.com/inner) <https://example.com/auto> tail</a>",
+            "<a href='https://example.com/outer'>**bold</a> tail** outside",
+        ] {
+            let parsed = parse_markdown_with_options(source, true, false, false);
+            let links: Vec<_> = parsed
+                .events
+                .iter()
+                .filter_map(|(_, event)| {
+                    if let MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) = event {
+                        Some(dest_url.as_ref())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(links, ["https://example.com/outer"]);
+            let mut inline_stack = Vec::new();
+            for (_, event) in &parsed.events {
+                match event {
+                    MarkdownEvent::Start(MarkdownTag::Link { .. }) => {
+                        inline_stack.push(MarkdownTagEnd::Link)
+                    }
+                    MarkdownEvent::Start(MarkdownTag::Strong) => {
+                        inline_stack.push(MarkdownTagEnd::Strong)
+                    }
+                    MarkdownEvent::End(tag @ (MarkdownTagEnd::Link | MarkdownTagEnd::Strong)) => {
+                        assert_eq!(inline_stack.pop().as_ref(), Some(tag))
+                    }
+                    _ => {}
+                }
+            }
+            assert!(inline_stack.is_empty());
+        }
+    }
+    #[test]
+    fn inline_html_anchor_closes_before_enclosing_markdown_style() {
+        let source = "**before <a href='https://example.com'>linked** after</a> outside [next](https://example.com/next)";
+        let parsed = parse_markdown_with_options(source, true, false, false);
+        let mut stack = Vec::new();
+        let mut link_ranges = Vec::new();
+        for (range, event) in &parsed.events {
+            match event {
+                MarkdownEvent::Start(MarkdownTag::Link { .. }) => {
+                    stack.push(MarkdownTagEnd::Link);
+                    link_ranges.push(range);
+                }
+                MarkdownEvent::Start(MarkdownTag::Strong) => stack.push(MarkdownTagEnd::Strong),
+                MarkdownEvent::End(tag @ (MarkdownTagEnd::Link | MarkdownTagEnd::Strong)) => {
+                    assert_eq!(stack.pop().as_ref(), Some(tag))
+                }
+                _ => {}
+            }
+        }
+        assert!(stack.is_empty());
+        assert_eq!(link_ranges.len(), 2);
+        assert!(link_ranges[0].contains(&source.find("linked").unwrap()));
+        assert!(!link_ranges[0].contains(&source.find("after").unwrap()));
+        assert!(link_ranges[1].contains(&source.find("next]").unwrap()));
     }
 }
