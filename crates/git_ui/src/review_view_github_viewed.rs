@@ -162,10 +162,40 @@ impl ReviewView {
         Ok((operation, context))
     }
 
+    pub(super) fn github_viewed_needs_sync(&self) -> bool {
+        self.data.session.selector.supports_github_viewed()
+            && (self.github_viewed_initial_pending
+                || self.full_refresh_pending
+                || self.data.github_viewed.is_none())
+    }
+
     pub(super) fn sync_github_viewed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.github_viewed_busy || self.refreshing || self.outdated() {
+        if !self.data.session.selector.supports_github_viewed() {
             return;
         }
+        self.github_viewed_initial_pending = true;
+        self.drain_github_viewed_sync(window, cx);
+    }
+
+    pub(super) fn drain_github_viewed_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A requested Refresh must fetch new PR tips before reading file flags.
+        if self.drain_requested_full_refresh(window, cx) {
+            return;
+        }
+        if !self.github_viewed_initial_pending
+            || !self.data.session.selector.supports_github_viewed()
+            || self.github_viewed_busy
+            || self.github_viewed_preparing
+            || !self.github_viewed_pending_clicks.is_empty()
+            || self.refreshing
+            || self.cached_unverified
+            || self.outdated()
+        {
+            return;
+        }
+        // A preview is independent of the guarded server read. Consume this
+        // request once; failures stay visible until an explicit retry.
+        self.github_viewed_initial_pending = false;
         let (_, context) = match self.github_viewed_context() {
             Ok(context) => context,
             Err(error) => {
@@ -176,8 +206,13 @@ impl ReviewView {
         };
         let db = self.db.clone();
         let session = self.data.session.clone();
-        let recovery = crate::review_outbox_runtime::ready(db.clone(), cx);
         self.begin_viewed_work("Reading GitHub Viewed state…", cx);
+        #[cfg(test)]
+        if let Some(task) = self.github_viewed_sync_override.take() {
+            self.finish_viewed_work(task, session, window, cx);
+            return;
+        }
+        let recovery = crate::review_outbox_runtime::ready(db.clone(), cx);
         let (client, guard) = GitHubClient::cancellable();
         self.github_viewed_guard = Some(guard);
         let cancelled = self.github_viewed_cancel.clone();
@@ -465,6 +500,7 @@ impl ReviewView {
                         .collect::<Vec<_>>();
                     this.set_github_paths_viewed(paths, viewed, None, window, cx);
                 }
+                this.drain_github_viewed_sync(window, cx);
                 cx.notify();
             })
             .log_err();
@@ -573,6 +609,7 @@ impl ReviewView {
                     this.github_viewed_resume_origin = None;
                     this.handle_github_viewed_operation(origin, true, window, cx);
                 }
+                this.drain_github_viewed_sync(window, cx);
                 cx.notify();
             })
             .log_err();
@@ -768,6 +805,10 @@ impl ReviewView {
                         this.observed_revision = this.observed_revision.max(data.session.revision);
                         this.data = data;
                         this.github_viewed_intents = intents;
+                        this.changes.update(cx, |_, cx| cx.emit(ReviewChanged {
+                            session: this.data.session.id.clone(),
+                            revision: this.data.session.revision,
+                        }));
                     }
                     this.github_viewed_status = Some("Viewed flags confirmed · Saving review progress…".into());
                     cx.notify();
@@ -807,7 +848,10 @@ impl ReviewView {
                 if this.data.session.id != session.id
                     || this.data.session.snapshot.generation != session.snapshot.generation
                     || this.data.session.selector != session.selector
-                { return; }
+                {
+                    this.drain_github_viewed_sync(window, cx);
+                    return;
+                }
                 if let Ok(observed) = &data {
                     if !viewed_readback_authoritative(&this.data.session, &observed.session) { return; }
                 }
@@ -819,13 +863,27 @@ impl ReviewView {
                 this.collapsed_review_files.extend(confirmed_paths);
                 for path in confirmed_unviewed_paths { this.collapsed_review_files.remove(&path); }
                 if let Some(intents) = local_intents { this.github_viewed_intents = intents; }
-                this.finish(data, window, cx);
+                let data_error = match data {
+                    Ok(data) => {
+                        this.observed_revision = this.observed_revision.max(data.session.revision);
+                        this.data = data;
+                        this.apply_review_file_folds(cx);
+                        this.changes.update(cx, |_, cx| cx.emit(ReviewChanged {
+                            session: this.data.session.id.clone(),
+                            revision: this.data.session.revision,
+                        }));
+                        None
+                    }
+                    Err(error) => Some(format!("Could not reload Viewed state: {error:#}")),
+                };
                 this.github_viewed_remaining = remaining;
                 match result {
                     Ok(()) => { this.github_viewed_status = Some("GitHub Viewed state and retained local review history are synchronized.".into()); this.github_viewed_error = None; }
                     Err(error) => { this.github_viewed_status = None; this.github_viewed_error = Some(format!("Viewed synchronization stopped: {error:#}")); }
                 }
+                if let Some(error) = data_error { this.github_viewed_error = Some(error); }
                 if let Some(panel) = &this.github_panel { panel.update(cx, |panel, cx| panel.reload_local_operations(cx)); }
+                this.drain_github_viewed_sync(window, cx);
                 cx.notify();
             }).log_err();
         }).detach();
@@ -1254,7 +1312,7 @@ impl ReviewView {
                         this.update_in(cx, |this, _window, cx| {
                             this.layout_note = Some(message.into()); this.busy = false;
                             #[cfg(not(test))]
-                            if this.github_viewed_initial_pending { this.github_viewed_initial_pending = false; this.sync_github_viewed(_window, cx); }
+                            this.drain_github_viewed_sync(_window, cx);
                             cx.notify();
                         })?;
                         return Ok(());
@@ -1298,7 +1356,7 @@ impl ReviewView {
                     this.editor = Some(editor);
                     this.busy = false;
                     #[cfg(not(test))]
-                    if this.github_viewed_initial_pending { this.github_viewed_initial_pending = false; this.sync_github_viewed(window, cx); }
+                    this.drain_github_viewed_sync(window, cx);
                     cx.notify();
                     Ok::<_, anyhow::Error>(())
                 })??;

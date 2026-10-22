@@ -3635,14 +3635,39 @@ async fn assert_large_pr_window_collapse_after_selection_eviction(
             );
         }
     });
-    view.update_in(&mut cx, |view, window, cx| {
+    let rolling_focus = view.update_in(&mut cx, |view, window, cx| {
+        let editor = view.editor.as_ref().unwrap().read(cx);
+        let focused_editor = if split {
+            editor.lhs_editor().expect("actual split editor")
+        } else {
+            editor.rhs_editor()
+        };
+        let focus = focused_editor.read(cx).focus_handle(cx);
+        focus.focus(window, cx);
         view.prepared_files.clear();
         view.prepared_bytes = 0;
         view.data.session.presentation.selected_path = Some("file-026.ts".into());
         view.rolling_scroll = true;
         view.load_selected(window, cx);
+        assert!(
+            view.rolling_file_load,
+            "the rolling window prepares in the background"
+        );
+        assert!(!view.busy, "scrolling does not disable the review toolbar");
+        assert!(
+            focus.is_focused(window),
+            "prefetch must not move focus to the review parent"
+        );
+        focus
     });
-    cx.condition(&view, |view, _| !view.busy).await;
+    cx.condition(&view, |view, _| !view.rolling_file_load).await;
+    view.update_in(&mut cx, |view, window, _| {
+        assert!(!view.busy);
+        assert!(
+            rolling_focus.is_focused(window),
+            "prefetch keeps the same native editor side focused"
+        );
+    });
     view.read_with(&cx, |view, cx| {
         assert!(view.error.is_none(), "{:?}", view.error);
         let editor = view.editor.as_ref().unwrap();
@@ -3792,9 +3817,10 @@ async fn assert_large_pr_window_collapse_after_selection_eviction(
             view.data.session.presentation.selected_path = Some(format!("file-{center:03}.ts"));
             view.rolling_scroll = true;
             view.load_selected(window, cx);
+            assert!(!view.busy, "rolling windows never block the review toolbar");
             cursors
         });
-        cx.condition(&view, |view, _| !view.busy).await;
+        cx.condition(&view, |view, _| !view.rolling_file_load).await;
         view.read_with(&cx, |view, _| {
             assert!(view.error.is_none(), "{:?}", view.error);
             assert_eq!(view.editor.as_ref().unwrap().entity_id(), editor_id);
@@ -3826,6 +3852,46 @@ async fn assert_large_pr_window_collapse_after_selection_eviction(
         }
         cx.run_until_parked();
     }
+    view.update_in(&mut cx, |view, window, cx| {
+        view.data.session.presentation.selected_path = Some("file-042.ts".into());
+        view.rolling_scroll = true;
+        view.load_selected(window, cx);
+        assert!(view.rolling_file_load);
+        // A review write owns the ordinary task slot while prefetch continues.
+        view.task = Some(Task::ready(()));
+        view.busy = true;
+    });
+    cx.condition(&view, |view, _| !view.rolling_file_load).await;
+    view.update_in(&mut cx, |view, window, cx| {
+        assert!(view.error.is_none(), "{:?}", view.error);
+        assert!(
+            view.busy,
+            "prefetch completion cannot finish an unrelated review write"
+        );
+        view.busy = false;
+        view.data.session.presentation.selected_path = Some("file-043.ts".into());
+        view.rolling_scroll = true;
+        view.load_selected(window, cx);
+        let request = view.file_request;
+        let mut presentation = view.data.session.presentation.clone();
+        presentation.selected_path = Some("file-042.ts".into());
+        view.change_presentation(presentation, window, cx);
+        assert!(
+            !view.rolling_file_load,
+            "explicit navigation cancels stale prefetch"
+        );
+        assert!(view.rolling_file_task.is_none());
+        assert!(view.file_request > request);
+        assert_eq!(view.editor.as_ref().unwrap().entity_id(), editor_id);
+    });
+    cx.run_until_parked();
+    view.read_with(&cx, |view, _| {
+        assert_eq!(
+            view.data.session.presentation.selected_path.as_deref(),
+            Some("file-042.ts")
+        );
+        assert!(!view.rolling_file_load);
+    });
 }
 
 #[gpui::test]
@@ -4285,4 +4351,236 @@ fn review_progress_from_supplied_database() -> Result<()> {
         data.checkpoint_viewed.len()
     );
     Ok(())
+}
+
+async fn viewed_sync_session(fixture: &Fixture) -> Result<ReviewSession> {
+    let snapshot = fixture.session.snapshot.clone();
+    fixture
+        .db
+        .deploy_pull_request(
+            fixture.session.repository.id.clone(),
+            PullRequestIdentity {
+                host: "github.com".into(),
+                repository_node_id: "R_sync".into(),
+                pull_request_node_id: "PR_sync".into(),
+                viewer_node_id: "U_sync".into(),
+            },
+            PullRequestMetadata {
+                owner: "example".into(),
+                repository: "repository".into(),
+                number: 1,
+                title: "Sync".into(),
+                base_ref_name: "main".into(),
+                head_ref_name: "feature".into(),
+                base_ref_oid: snapshot.groups[0].endpoints.left.hex.clone(),
+                head_ref_oid: snapshot.groups[0].endpoints.right.hex.clone(),
+                commit_count: Some(1),
+            },
+            snapshot,
+            None,
+        )
+        .await
+}
+
+#[gpui::test]
+async fn viewed_read_is_independent_of_preview_busy_error_and_empty_selection(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx).await.expect("fixture");
+    let session = viewed_sync_session(&fixture).await.expect("PR session");
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    for (busy, error, empty) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        view.update_in(&mut cx, |view, window, cx| {
+            view.data = read_data(&fixture.db, session.clone()).expect("PR data");
+            view.observed_revision = session.revision;
+            view.busy = busy;
+            view.error = error.then(|| "Preview exceeded its size budget".into());
+            if empty {
+                view.data.session.presentation.selected_path = None;
+            }
+            view.github_viewed_sync_override = Some(Task::ready(Err(anyhow::anyhow!(
+                "Independent server failure"
+            ))));
+            view.sync_github_viewed(window, cx);
+            assert!(
+                view.github_viewed_busy,
+                "Preview state must not postpone the server read"
+            );
+            assert!(!view.github_viewed_initial_pending);
+        });
+        cx.condition(&view, |view, _| !view.github_viewed_busy)
+            .await;
+        view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.busy, busy,
+                "Viewed completion must not finish a preview it does not own"
+            );
+            assert!(
+                view.github_viewed_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Independent server failure"))
+            );
+            assert!(
+                view.github_viewed_needs_sync(),
+                "Incomplete server observations must never advertise Ready"
+            );
+            assert!(view.github_viewed_sync_override.is_none());
+        });
+    }
+}
+
+#[gpui::test]
+async fn viewed_read_coalesces_refresh_overlap_and_does_not_retry_failure(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.expect("fixture");
+    let session = viewed_sync_session(&fixture).await.expect("PR session");
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    view.update_in(&mut cx, |view, window, cx| {
+        view.data = read_data(&fixture.db, session.clone()).expect("PR data");
+        view.observed_revision = session.revision;
+        view.refreshing = true;
+        view.github_viewed_sync_override =
+            Some(Task::ready(Err(anyhow::anyhow!("One requested read"))));
+        view.sync_github_viewed(window, cx);
+        view.sync_github_viewed(window, cx);
+        assert!(view.github_viewed_initial_pending);
+        assert!(!view.github_viewed_busy);
+        assert!(view.github_viewed_sync_override.is_some());
+        view.refreshing = false;
+        view.drain_github_viewed_sync(window, cx);
+        assert!(view.github_viewed_busy);
+        assert!(!view.github_viewed_initial_pending);
+        assert!(view.github_viewed_sync_override.is_none());
+    });
+    cx.condition(&view, |view, _| !view.github_viewed_busy)
+        .await;
+    view.update_in(&mut cx, |view, window, cx| {
+        assert!(
+            view.github_viewed_error
+                .as_deref()
+                .is_some_and(|error| error.contains("One requested read"))
+        );
+        assert!(
+            !view.github_viewed_initial_pending,
+            "A failed read must not automatically retry forever"
+        );
+        view.drain_github_viewed_sync(window, cx);
+        assert!(!view.github_viewed_busy);
+    });
+}
+
+#[gpui::test]
+async fn full_refresh_request_survives_viewed_work_and_local_persistence(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.expect("fixture");
+    let session = viewed_sync_session(&fixture).await.expect("PR session");
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    view.update_in(&mut cx, |view, window, cx| {
+        view.data = read_data(&fixture.db, session.clone()).expect("PR data");
+        view.observed_revision = session.revision;
+        view.github_viewed_initial_pending = false;
+        view.github_viewed_busy = true;
+        view.refresh(window, cx);
+        view.refresh(window, cx);
+        assert!(view.full_refresh_pending);
+        assert!(
+            !view.github_viewed_initial_pending,
+            "Full Refresh is not an old-head flag read"
+        );
+        assert!(!view.drain_requested_full_refresh(window, cx));
+        view.github_viewed_busy = false;
+        view.github_viewed_preparing = true;
+        assert!(!view.drain_requested_full_refresh(window, cx));
+        view.github_viewed_preparing = false;
+        view.github_viewed_pending_clicks
+            .insert("auth.ts".into(), true);
+        assert!(!view.drain_requested_full_refresh(window, cx));
+        view.github_viewed_pending_clicks.clear();
+        view.drain_github_viewed_sync(window, cx);
+        assert!(!view.full_refresh_pending);
+        assert!(
+            view.refreshing,
+            "The queued action must enter the full tip-fetching refresh path"
+        );
+        assert!(view.refresh_task.is_some());
+        // The refresh coordinator has not been polled. Cancel before transport;
+        // this regression verifies scheduling, not mocked network acceptance.
+        view.refresh_task = None;
+        view.refreshing = false;
+        assert!(
+            !view.drain_requested_full_refresh(window, cx),
+            "Repeated clicks coalesce into one full refresh"
+        );
+    });
+}
+
+#[gpui::test]
+async fn authoritative_viewed_read_notifies_other_windows_without_preview_reload(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx).await.expect("fixture");
+    let session = viewed_sync_session(&fixture).await.expect("PR session");
+    let (view, mut first_cx) = review_window(&fixture, cx, None);
+    first_cx
+        .condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let app_state = view.read_with(&first_cx, |view, cx| {
+        view.workspace
+            .upgrade()
+            .expect("workspace")
+            .read(cx)
+            .app_state()
+            .clone()
+    });
+    let (other, mut other_cx) = review_window(&fixture, cx, Some(app_state));
+    other_cx
+        .condition(&other, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    view.update(&mut first_cx, |view, _| {
+        view.data = read_data(&fixture.db, session.clone()).expect("PR data");
+        view.observed_revision = session.revision;
+    });
+    other.update(&mut other_cx, |view, _| {
+        view.data = read_data(&fixture.db, session.clone()).expect("PR data");
+        view.observed_revision = session.revision;
+    });
+    let revision = fixture
+        .db
+        .save_presentation(
+            session.id.clone(),
+            session.revision,
+            session.presentation.clone(),
+        )
+        .await
+        .expect("advance durable revision");
+    view.update_in(&mut first_cx, |view, window, cx| {
+        view.github_viewed_sync_override = Some(Task::ready(Ok(
+            github_viewed::ViewedWork::observed_for_test(revision),
+        )));
+        view.sync_github_viewed(window, cx);
+    });
+    first_cx
+        .condition(&view, |view, _| !view.github_viewed_busy)
+        .await;
+    other_cx
+        .condition(&other, |view, _| view.observed_revision == revision)
+        .await;
+    other.read_with(&other_cx, |view, _| {
+        assert!(
+            view.outdated(),
+            "The other window must learn about the newer authoritative state"
+        );
+        assert_eq!(
+            view.data.session.revision, session.revision,
+            "Do not rebuild another window's preview as a side effect"
+        );
+    });
 }

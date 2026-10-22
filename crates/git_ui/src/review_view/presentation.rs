@@ -65,6 +65,8 @@ impl Render for ReviewView {
                         .unwrap_or_else(|| "Syncing with GitHub…".into())
                 } else if self.outdated() {
                     "Review changed · Refresh to continue".into()
+                } else if self.github_viewed_needs_sync() {
+                    "GitHub Viewed state not synchronized · Refresh to retry".into()
                 } else {
                     "Ready".into()
                 }

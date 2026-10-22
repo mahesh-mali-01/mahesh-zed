@@ -1029,10 +1029,14 @@ pub struct ReviewView {
     github_viewed_cancel: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     github_viewed_retention_pause: Option<Task<()>>,
+    #[cfg(test)]
+    github_viewed_sync_override: Option<Task<Result<github_viewed::ViewedWork>>>,
     retained: Option<RetainedContents>,
     multi_loaded: bool,
     loaded_window_scope: Option<(u64, String, bool)>,
     rolling_scroll: bool,
+    rolling_file_load: bool,
+    rolling_file_task: Option<Task<()>>,
     collapsed_review_files: BTreeSet<String>,
     local_viewed_pin: Option<String>,
     layout_note: Option<String>,
@@ -1043,6 +1047,7 @@ pub struct ReviewView {
     checking: bool,
     refreshing: bool,
     refresh_task: Option<Task<()>>,
+    full_refresh_pending: bool,
     update_available: bool,
     check_error: Option<String>,
     check_request: u64,
@@ -2729,6 +2734,7 @@ impl ReviewView {
             checking: false,
             refreshing: false,
             refresh_task: None,
+            full_refresh_pending: false,
             update_available: false,
             check_error: None,
             check_request: 0,
@@ -2780,10 +2786,14 @@ impl ReviewView {
             github_viewed_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             github_viewed_retention_pause: None,
+            #[cfg(test)]
+            github_viewed_sync_override: None,
             retained: None,
             multi_loaded: false,
             loaded_window_scope: None,
             rolling_scroll: false,
+            rolling_file_load: false,
+            rolling_file_task: None,
             collapsed_review_files: locally_collapsed,
             local_viewed_pin,
             layout_note: None,
@@ -2797,6 +2807,8 @@ impl ReviewView {
             this.reveal_selected_tree_row();
             this.load_selected(window, cx);
             this.check_for_updates(window, cx);
+            #[cfg(not(test))]
+            this.drain_github_viewed_sync(window, cx);
         });
         view
     }
@@ -2919,6 +2931,8 @@ impl ReviewView {
                                     this.ensure_github_panel(window, cx);
                                     this.capture_github_selection(cx);
                                     this.rebuild_github_blocks(window, cx);
+                                    #[cfg(not(test))]
+                                    this.drain_github_viewed_sync(window, cx);
                                 }
                                 this.check_error = if this.cached_unverified {
                                     Some("Cached PR revision differs from GitHub. Refresh to load current changes; saved drafts remain local.".into())
@@ -2991,8 +3005,27 @@ impl ReviewView {
         cx.notify();
     }
 
+    fn drain_requested_full_refresh(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.full_refresh_pending
+            || self.github_viewed_preparing
+            || !self.github_viewed_pending_clicks.is_empty()
+            || self.github_viewed_busy
+            || self.refreshing
+        {
+            return false;
+        }
+        self.full_refresh_pending = false;
+        self.refresh(window, cx);
+        true
+    }
+
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.github_viewed_preparing || !self.github_viewed_pending_clicks.is_empty() {
+            self.full_refresh_pending |= self.data.session.selector.supports_github_viewed();
             self.github_viewed_status =
                 Some("Finish saving local Viewed changes before refreshing the PR".into());
             cx.notify();
@@ -3053,7 +3086,9 @@ impl ReviewView {
             return;
         }
         if self.data.pull_request.is_some() {
-            if self.busy || self.github_viewed_busy || self.refreshing {
+            if self.github_viewed_busy || self.refreshing {
+                self.full_refresh_pending = true;
+                cx.notify();
                 return;
             }
             let metadata = self.data.pull_request.clone();
@@ -3103,12 +3138,15 @@ impl ReviewView {
                             if let Some(panel) = &this.github_panel {
                                 panel.update(cx, |panel, cx| panel.reload(window, cx));
                             }
-                            if this.data.session.selector.supports_github_viewed() {
+                            if !this.drain_requested_full_refresh(window, cx)
+                                && this.data.session.selector.supports_github_viewed()
+                            {
                                 this.sync_github_viewed(window, cx);
                             }
                         }
                         Err(error) => {
                             this.check_error = Some(format!("Could not refresh: {error:#}"));
+                            this.drain_requested_full_refresh(window, cx);
                         }
                     }
                     cx.notify();
@@ -3314,6 +3352,9 @@ impl ReviewView {
     }
 
     fn load_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scroll_driven = std::mem::take(&mut self.rolling_scroll);
+        self.rolling_file_task = None;
+        self.rolling_file_load = false;
         if matches!(
             self.data.session.selector,
             ComparisonSelector::PullRequestScope { .. }
@@ -3326,13 +3367,14 @@ impl ReviewView {
             self.load_since_review_selected(window, cx);
             return;
         }
+        self.rolling_file_load = scroll_driven;
         if let Some(panel) = &self.github_panel {
             panel.update(cx, |panel, cx| panel.set_incremental_mode(false, cx));
         }
         let started = Instant::now();
         // The previous editor and its layout remain visible until replacement.
         // Do not temporarily advertise Single file while a scrolling view prepares.
-        if self.focus.contains_focused(window, cx) {
+        if !scroll_driven && self.focus.contains_focused(window, cx) {
             self.focus.focus(window, cx);
         }
         self.file_request = self.file_request.saturating_add(1);
@@ -3347,6 +3389,7 @@ impl ReviewView {
             self.github_block_keys.clear();
             self.clear_selection_affordance(cx);
             self.busy = false;
+            self.rolling_file_load = false;
             cx.notify();
             return;
         };
@@ -3360,11 +3403,12 @@ impl ReviewView {
             Err(error) => {
                 self.error = Some(error.to_string());
                 self.busy = false;
+                self.rolling_file_load = false;
                 cx.notify();
                 return;
             }
         };
-        self.busy = true;
+        self.busy = !scroll_driven;
         let fingerprint = format!(
             "{}:{}:{}",
             self.data.session.id,
@@ -3388,7 +3432,7 @@ impl ReviewView {
         let project = self.project.clone();
         let workspace = self.workspace.clone();
         let prepared_cache = self.prepared_files.clone();
-        self.task = Some(cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let result: Result<()> = async {
                 let mut cache_hits = usize::from(cached_prepared.is_some());
                 let mut cache_misses = usize::from(cached_prepared.is_none());
@@ -3780,8 +3824,6 @@ impl ReviewView {
                             editor.update(cx, |editor, cx| editor.remove_excerpts_for_path(PathKey::with_sort_prefix(1, repo_path.as_ref().clone()), cx));
                         }
                     }
-                    let scroll_driven = this.rolling_scroll;
-                    this.rolling_scroll = false;
                     let review_header = cx.weak_entity();
                     editor.update(cx, |editor, cx| {
                         editor.rhs_editor().update(cx, |editor, _| editor.register_addon(ReviewFileHeaderAddon { review: review_header.clone() }));
@@ -3892,7 +3934,7 @@ impl ReviewView {
                             }
                         });
                     });
-                    if this.focus.contains_focused(window, cx) {
+                    if !scroll_driven && this.focus.contains_focused(window, cx) {
                         editor.focus_handle(cx).focus(window, cx);
                     }
                     this.github_editor_subscription = Some(cx.subscribe_in(
@@ -3923,9 +3965,12 @@ impl ReviewView {
                     ));
                     this.editor = Some(editor);
                     this.install_review_context_menus(cx);
-                    this.busy = false;
+                    if !scroll_driven {
+                        this.busy = false;
+                    }
                     this.capture_github_selection(cx);
                     this.rebuild_github_blocks(window, cx);
+                    this.rolling_file_load = false;
                     this.retained = Some(retained);
                     this.multi_loaded = multi_loaded;
                     this.loaded_window_scope = Some(scope);
@@ -3934,12 +3979,11 @@ impl ReviewView {
                     }
                     this.apply_review_file_folds(cx);
                     this.layout_note = layout_note;
-                    this.busy = false;
-                    #[cfg(not(test))]
-                    if this.github_viewed_initial_pending {
-                        this.github_viewed_initial_pending = false;
-                        this.sync_github_viewed(window, cx);
+                    if !scroll_driven {
+                        this.busy = false;
                     }
+                    #[cfg(not(test))]
+                    this.drain_github_viewed_sync(window, cx);
                     log::info!("review preparation cache: {cache_hits} hits, {cache_misses} misses");
                     log::info!(
                         "pull request review review file ready: {} files rendered in {} ms (excludes paint)",
@@ -3963,18 +4007,29 @@ impl ReviewView {
             .await;
             if let Err(error) = result {
                 this.update(cx, |this, cx| {
-                    this.busy = false;
+                    if this.file_request != request {
+                        return;
+                    }
+                    this.rolling_file_load = false;
+                    if !scroll_driven {
+                        this.busy = false;
+                    }
                     this.error = Some(format!("Unable to load snapshot: {error:#}"));
                     cx.notify();
                 })
                 .log_err();
             }
-        }));
+        });
+        if scroll_driven {
+            self.rolling_file_task = Some(task);
+        } else {
+            self.task = Some(task);
+        }
         cx.notify();
     }
 
     fn extend_scrolling_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || !self.multi_loaded || self.data.files.len() < 50 {
+        if self.busy || self.rolling_file_load || !self.multi_loaded || self.data.files.len() < 50 {
             return;
         }
         let Some(editor) = self.editor.as_ref() else {
@@ -4087,6 +4142,11 @@ impl ReviewView {
             || before.split_view != presentation.split_view
             || before.multi_file != presentation.multi_file
             || before.since_review != presentation.since_review;
+        if reload && self.rolling_file_load {
+            self.rolling_file_task = None;
+            self.rolling_file_load = false;
+            self.file_request = self.file_request.saturating_add(1);
+        }
         if before.selected_path != presentation.selected_path
             || before.unreviewed_only != presentation.unreviewed_only
             || before.selected_group != presentation.selected_group

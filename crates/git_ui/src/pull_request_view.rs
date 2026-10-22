@@ -137,6 +137,7 @@ fn commit_history_rows(
 }
 
 pub struct PullRequestView {
+    focus: FocusHandle,
     workspace: WeakEntity<Workspace>,
     preview: bool,
     preview_panel: Option<Entity<crate::review_github_view::GitHubReviewPanel>>,
@@ -407,7 +408,7 @@ impl PullRequestView {
             .find(|view| !view.read(cx).preview);
         if let Some(existing) = existing {
             existing.update(cx, |view, cx| {
-                view.showing_commits = false;
+                view.show_conversation(window, cx);
                 let same_reference = view.selected.as_ref() == Some(&reference);
                 let reusable = same_reference
                     && view.viewer.is_some()
@@ -513,6 +514,7 @@ impl PullRequestView {
             }
         });
         Self {
+            focus: cx.focus_handle(),
             workspace,
             preview: false,
             preview_panel: None,
@@ -665,7 +667,18 @@ impl PullRequestView {
         let _ = window;
     }
 
+    fn show_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.showing_commits = false;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
     fn show_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        self.load_commits(window, cx);
+    }
+
+    fn load_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.showing_commits = true;
         if self.viewer.is_none() {
             cx.notify();
@@ -1019,6 +1032,14 @@ impl PullRequestView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.selected.as_ref() != Some(&reference)
+            || self
+                .reference_input
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        {
+            self.focus.focus(window, cx);
+        }
         if self.preview {
             self.selected = Some(reference);
             self.install_preview_details(window, cx);
@@ -1091,7 +1112,7 @@ impl PullRequestView {
                         }));
                         this.details = Some(details);
                         if this.showing_commits {
-                            this.show_commits(window, cx);
+                            this.load_commits(window, cx);
                         }
                         this.load_activity(reference, generation, window, cx);
                     }
@@ -1387,7 +1408,11 @@ pub(crate) fn repository_from_remote(remote: &str) -> Option<RepositoryName> {
 impl EventEmitter<ItemEvent> for PullRequestView {}
 impl Focusable for PullRequestView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.reference_input.focus_handle(cx)
+        if self.selected.is_some() {
+            self.focus.clone()
+        } else {
+            self.reference_input.focus_handle(cx)
+        }
     }
 }
 impl Item for PullRequestView {
@@ -2032,9 +2057,8 @@ impl Render for PullRequestView {
                                         .style(ButtonStyle::Outlined)
                                         .size(ButtonSize::Large)
                                         .toggle_state(!self.showing_commits)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.showing_commits = false;
-                                            cx.notify();
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.show_conversation(window, cx);
                                         })),
                                 )
                                 .child(
@@ -2131,9 +2155,8 @@ impl Render for PullRequestView {
                                     .style(ButtonStyle::Outlined)
                                     .toggle_state(!self.showing_commits)
                                     .size(ButtonSize::Large)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.showing_commits = false;
-                                        cx.notify();
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_conversation(window, cx);
                                     })),
                             )
                             .child(
@@ -2205,6 +2228,8 @@ impl Render for PullRequestView {
             .attach(gpui::Anchor::BottomLeft)
             .offset(gpui::point(px(0.), px(6.)));
         let main = v_flex()
+            .key_context("PullRequestView")
+            .track_focus(&self.focus)
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .when(self.selected.is_none(), |root| {
@@ -2500,6 +2525,96 @@ impl PickerDelegate for FacetDelegate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn selected_pages_keep_keyboard_actions_after_editor_navigation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/review-focus",
+            serde_json::json!({".git": {}, "example.rs": "fn main() {}"}),
+        )
+        .await;
+        let project = project::Project::test(fs, [std::path::Path::new("/review-focus")], cx).await;
+        let (multi, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
+        let reference =
+            PullRequestReference::parse("https://github.com/example/review-preview/pull/1", None)
+                .expect("reference");
+        let overview = workspace.update_in(cx, |workspace, window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = PullRequestView::new(
+                    workspace.weak_handle(),
+                    Some(reference.repository.clone()),
+                    window,
+                    cx,
+                );
+                view.preview = true;
+                view.install_preview(window, cx);
+                view.selected = Some(reference);
+                view.install_preview_details(window, cx);
+                view
+            });
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            view
+        });
+        let other = cx.update(|window, cx| cx.new(|cx| editor::Editor::single_line(window, cx)));
+        for commits in [true, false] {
+            overview.update_in(cx, |view, window, cx| {
+                if commits {
+                    view.show_commits(window, cx);
+                } else {
+                    view.show_conversation(window, cx);
+                }
+                assert!(view.focus_handle(cx).is_focused(window));
+                assert!(!view.reference_input.focus_handle(cx).is_focused(window));
+            });
+            cx.dispatch_action(ReviewPullRequestFiles);
+            cx.run_until_parked();
+            overview.update(cx, |view, _| {
+                assert!(
+                    view.files_error
+                        .take()
+                        .is_some_and(|error| error.contains("Offline component preview")),
+                    "the real workspace Files action reaches the selected page"
+                );
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(Box::new(other.clone()), None, true, window, cx);
+            });
+            overview.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            other.update_in(cx, |editor, window, cx| {
+                assert!(
+                    editor.focus_handle(cx).is_focused(window),
+                    "background PR rendering never steals editor focus"
+                );
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_item(&overview, true, true, window, cx);
+            });
+            cx.dispatch_action(ReviewPullRequestFiles);
+            cx.run_until_parked();
+            overview.update_in(cx, |view, window, cx| {
+                assert!(view.focus_handle(cx).is_focused(window));
+                assert!(
+                    view.files_error
+                        .take()
+                        .is_some_and(|error| error.contains("Offline component preview")),
+                    "Files command remains reachable after returning from a native editor tab"
+                );
+            });
+        }
+    }
     #[gpui::test]
     async fn overview_and_commits_activation_reuse_loaded_tab_without_requests(
         cx: &mut gpui::TestAppContext,
