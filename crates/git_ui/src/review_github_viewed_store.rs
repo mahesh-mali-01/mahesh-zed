@@ -255,37 +255,47 @@ fn unresolved_paths(
         .selector
         .pull_request_identity()
         .context("Not a PR session")?;
+    let current_metadata = metadata(connection, session)?;
     let ids = connection.select_bound::<String, String>(
         "SELECT id FROM review_operations WHERE identity = ? AND state != 'sent'",
     )?(serde_json::to_string(identity)?)?;
     let mut paths = BTreeSet::new();
     for id in ids {
         let operation = super::outbox::read_operation(connection, &id)?;
-        if operation.kind != ReviewOperationKind::SetFileViewed {
+        if operation.kind != ReviewOperationKind::SetFileViewed
+            || operation.context.selector != session.selector
+            || operation.context.metadata.head_ref_oid != current_metadata.head_ref_oid
+            || operation.context.metadata.base_ref_oid != current_metadata.base_ref_oid
+        {
             continue;
         }
-        if let Ok(intent) = serde_json::from_value::<GitHubViewedIntent>(operation.payload.clone())
+        let Ok(intent) = serde_json::from_value::<GitHubViewedIntent>(operation.payload.clone())
+        else {
+            continue;
+        };
+        // Historical failures remain recoverable records, but cannot suppress
+        // current observations in another checkout or after the PR tips change.
+        if intent.validate_for(session).is_err()
+            || intent.origin.as_ref().is_none_or(|origin| {
+                origin.session != session.id
+                    || origin.displayed_generation != session.snapshot.generation
+                    || origin.expected_revision > session.revision
+            })
         {
-            for path in intent.paths {
-                let superseded = operation.state == ReviewOperationState::DeliveryUnknown
-                    && connection.select_row_bound::<(String,String,String,i64),String>(
-                        "SELECT receipt_operation_id FROM review_github_viewed_superseded WHERE session_id = ? AND file_key = ? AND operation_id = ? AND generation = ?"
-                    )?((session.id.clone(),path.clone(),operation.operation_id.clone(),session.snapshot.generation as i64))?
-                    .is_some();
-                if !superseded {
-                    paths.insert(path);
-                }
+            continue;
+        }
+        for path in intent.paths {
+            if !current_paths.contains(&path) {
+                continue;
             }
-        } else if let Some(path) = operation
-            .payload
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-        {
-            paths.insert(path.to_owned());
-        } else {
-            // An older or malformed unresolved intent is not evidence that a
-            // remote flag can safely overwrite any local file's approval.
-            paths.extend(current_paths.iter().cloned());
+            let superseded = operation.state == ReviewOperationState::DeliveryUnknown
+                && connection.select_row_bound::<(String,String,String,i64),String>(
+                    "SELECT receipt_operation_id FROM review_github_viewed_superseded WHERE session_id = ? AND file_key = ? AND operation_id = ? AND generation = ?"
+                )?((session.id.clone(),path.clone(),operation.operation_id.clone(),session.snapshot.generation as i64))?
+                .is_some();
+            if !superseded {
+                paths.insert(path);
+            }
         }
     }
     Ok(paths)

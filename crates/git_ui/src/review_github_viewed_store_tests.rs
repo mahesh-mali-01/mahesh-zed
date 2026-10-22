@@ -687,8 +687,7 @@ fn github_viewed_metadata_read_validates_group_without_loading_retained_bytes() 
 }
 
 #[test]
-fn github_viewed_new_head_receipt_supersedes_old_unknown_only_for_current_generation() -> Result<()>
-{
+fn github_viewed_old_head_unknown_does_not_block_current_observations() -> Result<()> {
     let (_directory, db, initial) = setup()?;
     let unknown = operation(&db, &initial, &pr_metadata(), true, false)?;
     let mut metadata = pr_metadata();
@@ -700,33 +699,10 @@ fn github_viewed_new_head_receipt_supersedes_old_unknown_only_for_current_genera
         manifest(1, &metadata.head_ref_oid, b"second\n"),
         Some(initial.revision),
     ))?;
-    let blocked = sync(&db, &current, &metadata, ViewedState::Viewed)?;
-    assert!(blocked.decisions[0].observation.is_none());
-    let sent = operation(&db, &current, &metadata, true, true)?;
-    // Partial evidence cannot supersede the uncertain older operation.
-    assert!(
-        block_on(db.record_github_viewed_receipt(
-            target(&current),
-            sent.operation_id.clone(),
-            vec![]
-        ))
-        .is_err()
-    );
-    assert!(
-        block_on(db.import_github_viewed_checkpoint(
-            file_target(&current)?,
-            identity("U_viewer"),
-            bytes(b"second\n"),
-            1024
-        ))
-        .is_err()
-    );
-    block_on(db.record_github_viewed_receipt(
-        target(&current),
-        sent.operation_id,
-        remote(ViewedState::Viewed),
-    ))?;
+    let result = sync(&db, &current, &metadata, ViewedState::Viewed)?;
+    assert!(result.decisions[0].observation.is_some());
     let current = db.load_session(&current.id)?;
+    assert!(db.github_viewed_local_intents(&current)?.is_empty());
     block_on(db.import_github_viewed_checkpoint(
         file_target(&current)?,
         identity("U_viewer"),
@@ -734,16 +710,11 @@ fn github_viewed_new_head_receipt_supersedes_old_unknown_only_for_current_genera
         1024,
     ))?;
     assert_eq!(
-        db.operation(&unknown.operation_id)?.state,
-        ReviewOperationState::DeliveryUnknown
+        db.operation(&unknown.operation_id)?,
+        unknown,
+        "Historical uncertain delivery must remain untouched"
     );
     let current = db.load_session(&current.id)?;
-    assert_eq!(
-        db.github_viewed_overrides(&current, "comparison")?
-            .get("src/example.rs"),
-        Some(&true)
-    );
-    // A subsequent head invalidates supersession, even if the path survives.
     metadata.head_ref_oid = "5".repeat(40);
     let later = block_on(db.deploy_pull_request(
         current.repository.id,
@@ -752,11 +723,13 @@ fn github_viewed_new_head_receipt_supersedes_old_unknown_only_for_current_genera
         manifest(1, &metadata.head_ref_oid, b"third\n"),
         Some(current.revision),
     ))?;
+    let result = sync(&db, &later, &metadata, ViewedState::Viewed)?;
+    assert!(result.decisions[0].observation.is_some());
     assert!(
-        sync(&db, &later, &metadata, ViewedState::Viewed)?.decisions[0]
-            .observation
-            .is_none()
+        !result.decisions[0].effective_viewed,
+        "Observing the current server flag does not approve changed retained bytes"
     );
+    let later = db.load_session(&later.id)?;
     assert!(
         block_on(db.import_github_viewed_checkpoint(
             file_target(&later)?,
@@ -766,6 +739,7 @@ fn github_viewed_new_head_receipt_supersedes_old_unknown_only_for_current_genera
         ))
         .is_err()
     );
+    assert_eq!(db.operation(&unknown.operation_id)?, unknown);
     Ok(())
 }
 
@@ -1209,5 +1183,106 @@ fn latest_sent_viewed_toggle_suppresses_older_failed_intent_after_web_change() -
         db.github_viewed_local_intents(&current)?.is_empty(),
         "Latest terminal intent remains an ordering barrier instead of resurfacing either old toggle"
     );
+    Ok(())
+}
+
+#[test]
+fn github_viewed_other_checkout_failures_do_not_hide_current_flags() -> Result<()> {
+    for failed in [false, true] {
+        let (directory, db, session) = setup()?;
+        let (accepted, _) = block_on(db.accept_github_viewed_intent(
+            target(&session),
+            local_context(&session),
+            local_viewed_intent(&session, true)?,
+            BTreeMap::from([("src/example.rs".into(), bytes(b"first\n"))]),
+            None,
+            1024,
+        ))?;
+        let claimed =
+            block_on(db.claim_operation(accepted.operation_id, accepted.revision, Vec::new()))?;
+        let outcome = if failed {
+            ReviewOperationOutcome::Failed {
+                reason: "PR branches changed".into(),
+            }
+        } else {
+            ReviewOperationOutcome::DeliveryUnknown {
+                reason: "Read back unavailable".into(),
+            }
+        };
+        let preserved =
+            block_on(db.finish_operation(claimed.operation_id, claimed.revision, outcome))?;
+        let current = db.load_session(&session.id)?;
+        assert!(
+            sync(&db, &current, &pr_metadata(), ViewedState::Unviewed)?.decisions[0]
+                .observation
+                .is_none(),
+            "The exact original pending target still protects local intent"
+        );
+        let clone = directory.path().join("other-checkout");
+        fs::create_dir(&clone)?;
+        let binding = block_on(db.bind_repository(clone.clone(), clone, ObjectFormat::Sha1))?;
+        let cloned = block_on(db.deploy_pull_request(
+            binding.id,
+            identity("U_viewer"),
+            pr_metadata(),
+            session.snapshot.clone(),
+            None,
+        ))?;
+        let result = sync(&db, &cloned, &pr_metadata(), ViewedState::Viewed)?;
+        assert!(
+            result.decisions[0].observation.is_some(),
+            "Same PR/account/path/head in a different checkout must receive complete server observations"
+        );
+        let cloned = db.load_session(&cloned.id)?;
+        assert!(db.github_viewed_local_intents(&cloned)?.is_empty());
+        assert_eq!(
+            db.github_viewed_observations(&cloned.id, "comparison")?
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.operation(&preserved.operation_id)?,
+            preserved,
+            "Do not retry or rewrite historical failures"
+        );
+        assert_eq!(
+            db.github_viewed_local_intents(&current)?,
+            BTreeMap::from([("src/example.rs".into(), true)])
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn github_viewed_mismatched_tips_and_fingerprints_do_not_block_current_observations() -> Result<()>
+{
+    for mismatch in ["head", "base", "fingerprint"] {
+        let (_directory, db, session) = setup()?;
+        let mut stale = session.clone();
+        let mut metadata = pr_metadata();
+        match mismatch {
+            "head" => metadata.head_ref_oid = "4".repeat(40),
+            "base" => metadata.base_ref_oid = "4".repeat(40),
+            _ => {
+                stale.snapshot.groups[0].files[0]
+                    .new
+                    .as_mut()
+                    .unwrap()
+                    .object = ObjectId::for_blob(ObjectFormat::Sha1, b"other bytes\n")
+            }
+        }
+        let preserved = operation(&db, &stale, &metadata, true, false)?;
+        let result = sync(&db, &session, &pr_metadata(), ViewedState::Unviewed)?;
+        assert!(
+            result.decisions[0].observation.is_some(),
+            "A mismatched {mismatch} must not suppress current flags"
+        );
+        let current = db.load_session(&session.id)?;
+        assert_eq!(
+            db.github_viewed_observations(&current.id, "comparison")?["src/example.rs"].state,
+            ViewedState::Unviewed
+        );
+        assert_eq!(db.operation(&preserved.operation_id)?, preserved);
+    }
     Ok(())
 }
