@@ -1106,3 +1106,108 @@ fn github_viewed_new_toggle_never_rewrites_a_sending_operation() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn completed_viewed_toggles_do_not_reappear_when_web_state_changes() -> Result<()> {
+    for viewed in [true, false] {
+        let (directory, db, session) = setup()?;
+        let sent_state = if viewed {
+            ViewedState::Viewed
+        } else {
+            ViewedState::Unviewed
+        };
+        let web_state = if viewed {
+            ViewedState::Unviewed
+        } else {
+            ViewedState::Viewed
+        };
+        let sent = operation(&db, &session, &pr_metadata(), viewed, true)?;
+        block_on(db.record_github_viewed_receipt(
+            target(&session),
+            sent.operation_id.clone(),
+            remote(sent_state),
+        ))?;
+        let current = db.load_session(&session.id)?;
+        assert!(db.github_viewed_local_intents(&current)?.is_empty());
+        sync(&db, &current, &pr_metadata(), web_state)?;
+        let current = db.load_session(&session.id)?;
+        assert_eq!(
+            db.github_viewed_observations(&current.id, "comparison")?["src/example.rs"].state,
+            web_state
+        );
+        assert!(
+            db.github_viewed_local_intents(&current)?.is_empty(),
+            "A fresh remote change must not revive a completed opposite toggle"
+        );
+        assert_eq!(
+            db.operation(&sent.operation_id)?.state,
+            ReviewOperationState::Sent
+        );
+        drop(db);
+        let db = open(&directory.path().join("review.sqlite"))?;
+        let current = db.load_session(&session.id)?;
+        assert_eq!(
+            block_on(db.recover_github_viewed_receipts(target(&current)))?,
+            current.revision,
+            "Restart must not replay the completed receipt over newer remote state"
+        );
+        assert!(db.github_viewed_local_intents(&current)?.is_empty());
+        assert_eq!(
+            db.github_viewed_observations(&current.id, "comparison")?["src/example.rs"].state,
+            web_state
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn latest_sent_viewed_toggle_suppresses_older_failed_intent_after_web_change() -> Result<()> {
+    let (_directory, db, session) = setup()?;
+    let (first, _) = block_on(db.accept_github_viewed_intent(
+        target(&session),
+        local_context(&session),
+        local_viewed_intent(&session, true)?,
+        BTreeMap::from([("src/example.rs".into(), bytes(b"first\n"))]),
+        None,
+        1024,
+    ))?;
+    let first = block_on(db.claim_operation(first.operation_id, first.revision, Vec::new()))?;
+    block_on(db.finish_operation(
+        first.operation_id,
+        first.revision,
+        ReviewOperationOutcome::Failed {
+            reason: "Offline".into(),
+        },
+    ))?;
+    let current = db.load_session(&session.id)?;
+    let (last, _) = block_on(db.accept_github_viewed_intent(
+        target(&current),
+        local_context(&current),
+        local_viewed_intent(&current, false)?,
+        BTreeMap::new(),
+        None,
+        1024,
+    ))?;
+    let last = block_on(db.claim_operation(last.operation_id, last.revision, Vec::new()))?;
+    let last = block_on(db.finish_operation(
+        last.operation_id,
+        last.revision,
+        ReviewOperationOutcome::Sent {
+            server_ids: Vec::new(),
+        },
+    ))?;
+    let current = db.load_session(&session.id)?;
+    block_on(db.record_github_viewed_receipt(
+        target(&current),
+        last.operation_id,
+        remote(ViewedState::Unviewed),
+    ))?;
+    let current = db.load_session(&session.id)?;
+    sync(&db, &current, &pr_metadata(), ViewedState::Viewed)?;
+    let current = db.load_session(&session.id)?;
+    assert!(
+        db.github_viewed_local_intents(&current)?.is_empty(),
+        "Latest terminal intent remains an ordering barrier instead of resurfacing either old toggle"
+    );
+    Ok(())
+}

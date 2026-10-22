@@ -63,6 +63,8 @@ impl Render for ReviewView {
                     self.github_viewed_status
                         .clone()
                         .unwrap_or_else(|| "Syncing with GitHub…".into())
+                } else if !self.github_viewed_intents.is_empty() {
+                    "Viewed changes pending · Open Pending actions".into()
                 } else if self.outdated() {
                     "Review changed · Refresh to continue".into()
                 } else if self.github_viewed_needs_sync() {

@@ -561,15 +561,6 @@ impl ReviewDb {
             return Ok(BTreeMap::new());
         };
         let mut latest: BTreeMap<String, ((u64, String), bool, bool)> = BTreeMap::new();
-        let group = session
-            .snapshot
-            .groups
-            .first()
-            .context("PR comparison missing")?
-            .endpoints
-            .group
-            .clone();
-        let confirmed = read_cached(self, session, &group)?;
         for operation in self.operations(identity)? {
             if operation.kind != ReviewOperationKind::SetFileViewed
                 || operation.context.selector != session.selector
@@ -587,13 +578,10 @@ impl ReviewDb {
                 continue;
             }
             for path in intent.paths {
-                let acknowledged = operation.state == ReviewOperationState::Sent
-                    && confirmed.get(&path).is_some_and(|cached| {
-                        cached.observation.fingerprint == intent.fingerprints[&path]
-                            && (cached.observation.state == ViewedState::Viewed
-                                && cached.observation.trusted_viewed)
-                                == intent.viewed
-                    });
+                // Sent already includes independent server confirmation. A
+                // later web toggle must not resurrect that completed intent.
+                // Keep its order so older failed operations cannot resurface.
+                let acknowledged = operation.state == ReviewOperationState::Sent;
                 // Explicit retry can reuse an older operation UUID. Acceptance
                 // revision, not creation order, determines the user's latest intent.
                 let order = (
