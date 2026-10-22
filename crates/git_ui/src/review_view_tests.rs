@@ -4584,3 +4584,178 @@ async fn authoritative_viewed_read_notifies_other_windows_without_preview_reload
         );
     });
 }
+
+#[gpui::test]
+async fn reused_canonical_tab_adopts_fresh_durable_intents_and_preserves_unsaved_clicks(
+    cx: &mut TestAppContext,
+) {
+    let mut fixture = fixture(cx).await.expect("fixture");
+    fixture.session = viewed_sync_session(&fixture).await.expect("PR session");
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let editor_id = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().entity_id());
+    for viewed in [true, false] {
+        let session = fixture.db.load_session(&fixture.session.id).unwrap();
+        let contents = if viewed {
+            BTreeMap::from([(
+                "auth.ts".into(),
+                RetainedContents {
+                    old: Some(b"base auth\n".to_vec()),
+                    new: Some(b"reviewed auth\n".to_vec()),
+                },
+            )])
+        } else {
+            BTreeMap::new()
+        };
+        let (operation, _) = fixture
+            .db
+            .accept_github_viewed_intent(
+                github_viewed::sync_target(&session, session.revision),
+                ReviewOperationContext {
+                    selector: session.selector.clone(),
+                    metadata: fixture
+                        .db
+                        .pull_request_metadata(&session.id)
+                        .unwrap()
+                        .unwrap(),
+                },
+                github_viewed::viewed_intent(&session, vec!["auth.ts".into()], viewed).unwrap(),
+                contents,
+                None,
+                1024,
+            )
+            .await
+            .unwrap();
+        // Independent delivery already confirmed the new intent. The old tab
+        // still caches the opposite pending intent until its data is adopted.
+        let sending = fixture
+            .db
+            .claim_operation(operation.operation_id, operation.revision, vec![])
+            .await
+            .unwrap();
+        fixture
+            .db
+            .finish_operation(
+                sending.operation_id,
+                sending.revision,
+                ReviewOperationOutcome::Sent { server_ids: vec![] },
+            )
+            .await
+            .unwrap();
+        let fresh = read_data(&fixture.db, fixture.db.load_session(&session.id).unwrap()).unwrap();
+        assert!(fresh.durable_viewed_intents.is_empty());
+        view.update_in(&mut cx, |view, window, cx| {
+            view.github_viewed_intents.insert("auth.ts".into(), !viewed);
+            assert_eq!(view.effective_github_viewed("auth.ts"), !viewed);
+            view.finish(Ok(fresh.clone()), window, cx);
+            assert!(view.github_viewed_intents.is_empty());
+            assert_eq!(view.effective_github_viewed("auth.ts"), viewed);
+            assert_eq!(view.effective_data().viewed.contains("auth.ts"), viewed);
+            assert_eq!(view.effective_data().viewed.len(), usize::from(viewed));
+            assert!(!view.outdated());
+            assert_eq!(view.editor.as_ref().unwrap().entity_id(), editor_id);
+            // Unsaved clicks have their own ordering and survive a shared-tab
+            // reload until durable acceptance has finished.
+            view.github_viewed_accepting_clicks
+                .insert("auth.ts".into(), !viewed);
+            view.finish(Ok(fresh.clone()), window, cx);
+            assert_eq!(view.effective_github_viewed("auth.ts"), !viewed);
+            view.github_viewed_accepting_clicks.clear();
+            view.github_viewed_pending_clicks
+                .insert("auth.ts".into(), !viewed);
+            view.finish(Ok(fresh), window, cx);
+            assert_eq!(view.effective_github_viewed("auth.ts"), !viewed);
+            assert_eq!(view.effective_data().viewed.contains("auth.ts"), !viewed);
+            view.github_viewed_pending_clicks.clear();
+        });
+    }
+}
+
+#[gpui::test]
+async fn tree_file_checkboxes_align_and_do_not_activate_rows(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.expect("fixture");
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending).await;
+    let editor_id = view.update(&mut cx, |view, cx| {
+        view.data.session.selector = ComparisonSelector::PullRequest {
+            identity: PullRequestIdentity {
+                host: "github.com".into(),
+                repository_node_id: "R_tree".into(),
+                pull_request_node_id: "PR_tree".into(),
+                viewer_node_id: "U_tree".into(),
+            },
+        };
+        for path in ["src/one.ts", "src/deep/two.ts"] {
+            view.data.files.push(path.into());
+            view.data.session.snapshot.groups[0].files.push(comparison(path, b"before\n", b"after\n"));
+        }
+        // Hold retention so the actual checkbox handler queues local intent
+        // without invoking GitHub or loading the selected file's contents.
+        view.github_viewed_preparing = true;
+        cx.notify();
+        view.editor.as_ref().unwrap().entity_id()
+    });
+    cx.run_until_parked();
+    let rows = view.read_with(&cx, |view, _| review_tree(&view.effective_data()));
+    let folder_index = rows.iter().position(|row| row.path == "src").expect("folder");
+    let file_indices = ["auth.ts", "src/one.ts", "src/deep/two.ts"].map(|path| {
+        rows.iter().position(|row| row.path == path).expect("visible file")
+    });
+    let selectors = [
+        "REVIEW_TREE_VIEWED_0", "REVIEW_TREE_VIEWED_1", "REVIEW_TREE_VIEWED_2",
+        "REVIEW_TREE_VIEWED_3", "REVIEW_TREE_VIEWED_4", "REVIEW_TREE_VIEWED_5",
+    ];
+    let folder = cx.debug_bounds(selectors[folder_index]).expect("folder checkbox");
+    for index in file_indices {
+        let target = cx.debug_bounds(selectors[index]).expect("file checkbox");
+        assert_eq!(target.right(), folder.right(), "file/folder checkbox right edges ignore nesting");
+        assert_eq!(target.size.width, folder.size.width);
+        assert!(target.size.width >= px(24.));
+    }
+    let nested_index = file_indices[2];
+    for edge in 0..5 {
+        let target = cx.debug_bounds(selectors[nested_index]).expect("nested checkbox");
+        let position = match edge {
+            0 => target.center(),
+            1 => gpui::point(target.left() + px(1.), target.center().y),
+            2 => gpui::point(target.right() - px(1.), target.center().y),
+            3 => gpui::point(target.center().x, target.top() + px(1.)),
+            _ => gpui::point(target.center().x, target.bottom() - px(1.)),
+        };
+        cx.simulate_mouse_move(position, None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(position, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(position, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.data.session.presentation.selected_path.as_deref(), Some("auth.ts"), "checkbox gestures never activate another file");
+            assert_eq!(view.editor.as_ref().unwrap().entity_id(), editor_id);
+            assert_eq!(view.github_viewed_pending_clicks.get("src/deep/two.ts"), Some(&(edge % 2 == 0)), "the clicked file toggles, not the selected file");
+            assert!(!view.github_viewed_pending_clicks.contains_key("auth.ts"));
+        });
+    }
+    view.update(&mut cx, |view, cx| { view.busy = true; cx.notify(); });
+    cx.run_until_parked();
+    let target = cx.debug_bounds(selectors[nested_index]).expect("disabled nested checkbox");
+    cx.simulate_mouse_down(target.center(), gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_up(target.center(), gpui::MouseButton::Left, gpui::Modifiers::default());
+    view.update(&mut cx, |view, cx| {
+        assert_eq!(view.data.session.presentation.selected_path.as_deref(), Some("auth.ts"));
+        assert_eq!(view.github_viewed_pending_clicks.get("src/deep/two.ts"), Some(&true));
+        view.busy = false;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let billing_index = rows.iter().position(|row| row.path == "billing.ts").expect("ordinary row");
+    let label_selectors = [
+        "REVIEW_TREE_NAME_0", "REVIEW_TREE_NAME_1", "REVIEW_TREE_NAME_2",
+        "REVIEW_TREE_NAME_3", "REVIEW_TREE_NAME_4", "REVIEW_TREE_NAME_5",
+    ];
+    let label = cx.debug_bounds(label_selectors[billing_index]).expect("ordinary row label");
+    cx.simulate_mouse_down(label.center(), gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_up(label.center(), gpui::MouseButton::Left, gpui::Modifiers::default());
+    view.read_with(&cx, |view, _| {
+        assert_eq!(view.data.session.presentation.selected_path.as_deref(), Some("billing.ts"), "clicking outside the checkbox still activates the row");
+        assert!(!view.github_viewed_pending_clicks.contains_key("billing.ts"));
+    });
+}

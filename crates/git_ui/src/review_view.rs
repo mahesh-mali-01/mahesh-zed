@@ -138,6 +138,9 @@ struct ReviewData {
     checkpoint_viewed: BTreeSet<String>,
     // GitHub flags are distinct from exact-content local approval.
     github_viewed: Option<BTreeSet<String>>,
+    // Durable overlays travel with the loaded session so reusing an existing
+    // tab cannot retain older intents over newly fetched authoritative state.
+    durable_viewed_intents: BTreeMap<String, bool>,
     #[cfg(test)]
     changed: BTreeSet<String>,
     files: Vec<String>,
@@ -271,12 +274,14 @@ fn read_data(db: &ReviewDb, session: ReviewSession) -> Result<ReviewData> {
         }
     }
     let pull_request = db.pull_request_metadata(&session.id)?;
+    let durable_viewed_intents = db.github_viewed_local_intents(&session)?;
     Ok(ReviewData {
         pull_request,
         session,
         viewed,
         checkpoint_viewed,
         github_viewed,
+        durable_viewed_intents,
         #[cfg(test)]
         changed,
         files,
@@ -2697,12 +2702,7 @@ impl ReviewView {
             cx,
         ));
         let github_viewed_initial_pending = data.session.selector.supports_github_viewed();
-        let github_viewed_intents = db
-            .github_viewed_local_intents(&data.session)
-            .unwrap_or_else(|error| {
-                log::error!("Unable to restore pending Viewed intents: {error:#}");
-                BTreeMap::new()
-            });
+        let github_viewed_intents = data.durable_viewed_intents.clone();
         let locally_collapsed = github_viewed_intents
             .iter()
             .filter(|(_, viewed)| **viewed)
@@ -4260,6 +4260,9 @@ impl ReviewView {
                     return;
                 }
                 self.error = None;
+                // Pending/accepting click overlays remain independent. Only the
+                // durable map is replaced with the freshly loaded session data.
+                self.github_viewed_intents = data.durable_viewed_intents.clone();
                 self.tree_width_preview = None;
                 if self.refreshing {
                     data.session.presentation = self.data.session.presentation.clone();

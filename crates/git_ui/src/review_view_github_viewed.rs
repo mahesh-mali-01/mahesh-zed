@@ -1035,7 +1035,10 @@ pub(super) fn enqueue_viewed_delivery(
         remote.identity.viewer_node_id
     );
     let executor = cx.background_executor().clone();
-    crate::review_outbox_runtime::deliver(
+    let completion_db = db.clone();
+    let completion_session = session.id.clone();
+    let changes = ReviewChanges::global(cx);
+    let delivery = crate::review_outbox_runtime::deliver(
         lane,
         operation.operation_id.clone(),
         async move {
@@ -1156,7 +1159,38 @@ pub(super) fn enqueue_viewed_delivery(
             completed.context("Viewed batch omitted its owner")
         },
         cx,
-    )
+    );
+    let completion = delivery.clone();
+    // Receipts and the final server observation can advance the canonical
+    // revision after initial local acceptance. Invalidate every open tab even
+    // when delivery was initiated from a selected-commit view or a closed tab.
+    cx.spawn(async move |cx| {
+        if let Err(error) = completion.await {
+            // The original delivery observer owns user-facing error/retry UI.
+            // Still invalidate after failure: durable local acceptance remains.
+            log::info!("Viewed delivery needs attention before tab invalidation: {error}");
+        }
+        let current = cx
+            .background_spawn(async move { completion_db.load_session(&completion_session) })
+            .await;
+        match current {
+            Ok(session) => {
+                cx.update(|cx| {
+                    changes.update(cx, |_, cx| {
+                        cx.emit(ReviewChanged {
+                            session: session.id,
+                            revision: session.revision,
+                        })
+                    })
+                });
+            }
+            Err(error) => {
+                log::error!("Unable to invalidate review tabs after Viewed delivery: {error:#}");
+            }
+        }
+    })
+    .detach();
+    delivery
 }
 
 pub(super) fn sync_target(session: &ReviewSession, revision: u64) -> GitHubViewedSyncTarget {

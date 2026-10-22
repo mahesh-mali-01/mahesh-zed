@@ -229,18 +229,37 @@ impl Render for ReviewView {
                                     let mark_viewed = viewed_count < count;
                                     h_flex().debug_selector(|| "REVIEW_FOLDER_VIEWED_ACTION".into()).flex_none().min_w(rems(4.5)).pl_2().gap_2().justify_end()
                                         .child(Label::new(format!("{viewed_count}/{count}")).size(LabelSize::Small).color(Color::Muted))
-                                        .child(review_checkbox(("review-folder-viewed-target", index), Checkbox::new(("review-folder-viewed", index), ui::ToggleState::from_any_and_all(viewed_count > 0, count > 0 && viewed_count == count)).fill().style(ui::ToggleStyle::Custom(cx.theme().colors().text))
+                                        .child(div().debug_selector(move || format!("REVIEW_TREE_VIEWED_{index}")).child(review_checkbox(("review-folder-viewed-target", index), Checkbox::new(("review-folder-viewed", index), ui::ToggleState::from_any_and_all(viewed_count > 0, count > 0 && viewed_count == count)).fill().style(ui::ToggleStyle::Custom(cx.theme().colors().text))
                                             .tooltip(ui::Tooltip::text(format!("Mark all {count} changed files in this folder {} (including hidden files)", if mark_viewed { "viewed" } else { "unviewed" })))
                                             , writes_blocked || !this.data.session.selector.supports_github_viewed() || this.data.session.presentation.since_review,
                                             {
                                                 let review = cx.entity().downgrade();
                                                 move |window, cx| { review.update(cx, |this, cx| this.mark_github_folder(&folder, mark_viewed, window, cx)).log_err(); }
-                                            }))
+                                            })))
                                         .into_any_element()
                                 } else {
-                                    h_flex().flex_none().min_w(rems(2.5)).pl_2().gap_2().justify_end()
-                                        .when(is_viewed, |row| row.child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success)))
+                                    let path = entry.path.clone();
+                                    let review = cx.entity().downgrade();
+                                    let supports_review = this.data.session.selector.supports_github_viewed()
+                                        || matches!(this.data.session.selector, ComparisonSelector::PullRequestScope { .. });
+                                    h_flex().flex_none().min_w(rems(4.5)).pl_2().gap_2().justify_end()
                                         .child(Label::new(decoration).size(LabelSize::Small).color(color))
+                                        .child(div().debug_selector(move || format!("REVIEW_TREE_VIEWED_{index}")).child(review_checkbox(
+                                            ("review-file-viewed-target", index),
+                                            Checkbox::new(("review-file-viewed", index), is_viewed.into()).fill()
+                                                .style(ui::ToggleStyle::Custom(cx.theme().colors().text))
+                                                .tooltip(ui::Tooltip::text(if is_viewed { "Mark file unviewed" } else { "Mark file viewed" })),
+                                            writes_blocked || !supports_review || this.data.session.presentation.since_review,
+                                            move |window, cx| {
+                                                review.update(cx, |this, cx| {
+                                                    if this.data.session.selector.supports_github_viewed() {
+                                                        this.set_github_paths_viewed(vec![path.clone()], !is_viewed, None, window, cx);
+                                                    } else {
+                                                        this.review_commit_paths(vec![path.clone()], !is_viewed, true, window, cx);
+                                                    }
+                                                }).log_err();
+                                            },
+                                        )))
                                         .into_any_element()
                                 };
                                 let settings = ReviewTreeSettings::get_global(cx);
