@@ -637,3 +637,110 @@ fn inferred_acceptance_rejects_concurrent_scope_revocation_without_side_effects(
     assert_eq!(db.load_session(&canonical.id)?.revision, canonical.revision);
     Ok(())
 }
+
+#[test]
+fn legacy_explicit_baseline_survives_inferred_promotion_revoke_and_new_head() -> Result<()> {
+    use std::collections::BTreeMap;
+    let (_directory, db, initial) = setup()?;
+    let mut old_metadata = metadata();
+    old_metadata.head_ref_oid = oid(2).hex;
+    let old = block_on(db.deploy_pull_request(
+        initial.repository.id.clone(),
+        identity("U_reviewer"),
+        old_metadata,
+        snapshot(1, 2, b"a", b"b"),
+        Some(initial.revision),
+    ))?;
+    block_on(db.mark_viewed(
+        target(&old)?,
+        RetainedContents {
+            old: Some(b"a".to_vec()),
+            new: Some(b"b".to_vec()),
+        },
+        100,
+    ))?;
+    // Simulate a valid pre-feature checkpoint with no transition receipt.
+    block_on(db.write(|connection| connection.exec("DELETE FROM review_coverage")?()))?;
+    let old = db.load_session(&old.id)?;
+    let canonical = block_on(db.deploy_pull_request(
+        old.repository.id.clone(),
+        identity("U_reviewer"),
+        metadata(),
+        snapshot(1, 4, b"a", b"d"),
+        Some(old.revision),
+    ))?;
+    let tail = scope(&db, &canonical, 2, 4, b"b", b"d")?;
+    block_on(db.record_review_coverage(target(&tail)?))?;
+    let epoch = db.review_coverage_revision(&canonical)?;
+    assert!(db.reviewed_file_coverage(&canonical, "example.rs", &history())?);
+    block_on(
+        db.accept_covered_github_viewed_intent(
+            GitHubViewedSyncTarget {
+                session: canonical.id.clone(),
+                expected_revision: canonical.revision,
+                displayed_generation: canonical.snapshot.generation,
+            },
+            ReviewOperationContext {
+                selector: canonical.selector.clone(),
+                metadata: metadata(),
+            },
+            GitHubViewedIntent {
+                origin: None,
+                paths: vec!["example.rs".into()],
+                viewed: true,
+                fingerprints: BTreeMap::from([(
+                    "example.rs".into(),
+                    canonical
+                        .snapshot
+                        .file("comparison", "example.rs")?
+                        .fingerprint()?,
+                )]),
+            },
+            BTreeMap::from([(
+                "example.rs".into(),
+                RetainedContents {
+                    old: Some(b"a".to_vec()),
+                    new: Some(b"d".to_vec()),
+                },
+            )]),
+            None,
+            100,
+            epoch,
+        ),
+    )?;
+    let canonical = db.load_session(&canonical.id)?;
+    assert_eq!(db.review_coverage_revision(&canonical)?, epoch);
+    let tail = db.load_session(&tail.id)?;
+    block_on(db.revoke_review_coverage(target(&tail)?))?;
+    assert!(!db.reviewed_file_coverage(&canonical, "example.rs", &history())?);
+    let tail = db.load_session(&tail.id)?;
+    block_on(db.record_review_coverage(target(&tail)?))?;
+    assert!(db.reviewed_file_coverage(&canonical, "example.rs", &history())?);
+    let mut new_metadata = metadata();
+    new_metadata.head_ref_oid = oid(5).hex;
+    let newer = block_on(db.deploy_pull_request(
+        canonical.repository.id.clone(),
+        identity("U_reviewer"),
+        new_metadata.clone(),
+        snapshot(1, 5, b"a", b"e"),
+        Some(canonical.revision),
+    ))?;
+    let new_tail = block_on(db.create_pull_request_scope(
+        newer.repository.id.clone(),
+        identity("U_reviewer"),
+        new_metadata,
+        oid(1),
+        oid(5),
+        PullRequestCommitScope::Commits {
+            selections: vec![CommitSelection {
+                commit: oid(5),
+                parent: Some(oid(4)),
+            }],
+        },
+        snapshot(4, 5, b"d", b"e"),
+    ))?;
+    block_on(db.record_review_coverage(target(&new_tail)?))?;
+    let history = (1..=5).map(|value| oid(value).hex).collect();
+    assert!(db.reviewed_file_coverage(&newer, "example.rs", &history)?);
+    Ok(())
+}

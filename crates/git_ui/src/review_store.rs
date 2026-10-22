@@ -1382,3 +1382,70 @@ impl ReviewDb {
         review_coverage_revision_connection(self, canonical)
     }
 }
+
+/// Preserve a retained explicit full-file baseline before an inferred checkpoint
+/// replaces it. This is a representation migration, not new review evidence, so
+/// the shared coverage epoch remains unchanged. Derived checkpoints never seed
+/// receipts for their own approval.
+pub(super) fn preserve_review_coverage_baseline_connection(
+    connection: &Connection,
+    session: &ReviewSession,
+    group: &str,
+    path: &str,
+) -> Result<()> {
+    ensure!(
+        session.selector.supports_github_viewed() && session.snapshot.groups.len() == 1,
+        "Coverage baseline requires a canonical PR"
+    );
+    let Some((generation, json)) = connection.select_row_bound::<(String,String,String),(i64,String)>(
+        "SELECT generation,checkpoint FROM review_checkpoints WHERE session_id=? AND group_id=? AND file_key=?",
+    )?((session.id.clone(),group.to_owned(),path.to_owned()))? else { return Ok(()); };
+    let checkpoint: ReviewedCheckpoint = serde_json::from_str(&json)?;
+    checkpoint.comparison.validate(session.repository.format)?;
+    ensure!(
+        checkpoint.group == group
+            && checkpoint.comparison.file_key()? == path
+            && checkpoint.generation == generation as u64,
+        "Coverage baseline checkpoint identity is corrupt"
+    );
+    let fingerprint = checkpoint.comparison.fingerprint()?;
+    let promotion = connection.select_row_bound::<(String, String), String>(
+        "SELECT fingerprint FROM review_coverage_promotions WHERE session_id=? AND file_key=?",
+    )?((session.id.clone(), path.to_owned()))?;
+    if promotion.as_ref() == Some(&fingerprint) {
+        return Ok(());
+    }
+    let json = connection.select_row_bound::<(String, i64), String>(
+        "SELECT manifest FROM review_snapshots WHERE session_id=? AND generation=?",
+    )?((session.id.clone(), generation))?
+    .context("Coverage baseline snapshot missing")?;
+    let snapshot: ReviewSnapshot = serde_json::from_str(&json)?;
+    snapshot.validate(session.repository.format)?;
+    ensure!(
+        snapshot.generation == generation as u64,
+        "Coverage baseline generation is corrupt"
+    );
+    let current = session.snapshot.file(group, path)?;
+    let Some(previous) = snapshot
+        .groups
+        .iter()
+        .find(|entry| entry.endpoints.group == group)
+    else {
+        return Ok(());
+    };
+    if previous.endpoints.left != session.snapshot.groups[0].endpoints.left
+        || checkpoint.comparison.old != current.old
+        || !previous
+            .files
+            .iter()
+            .any(|file| file == &checkpoint.comparison)
+    {
+        return Ok(());
+    }
+    let (identity, base_tip) =
+        review_coverage_context(connection, session)?.context("Coverage requires a PR")?;
+    connection.exec_bound::<(String,String,String,String,String,String,String,String)>(
+        "INSERT OR IGNORE INTO review_coverage(repository_id,identity,base_tip,file_key,fingerprint,left_oid,right_oid,comparison) VALUES (?,?,?,?,?,?,?,?)",
+    )?((session.repository.id.clone(),identity,base_tip,path.to_owned(),fingerprint,previous.endpoints.left.hex.clone(),previous.endpoints.right.hex.clone(),serde_json::to_string(&checkpoint.comparison)?))?;
+    Ok(())
+}

@@ -1,9 +1,10 @@
 //! Persisted remote approval is independent of retained local review history.
 //! Every write uses the full PR's account/clone/session and pinned-generation CAS.
 use super::{
-    ReviewDb, StaleReview, ViewedTarget, bump_revision, ensure_durable, read_session,
-    record_review_coverage_connection, require_revision, retain,
-    review_coverage_revision_connection, revoke_review_coverage_connection,
+    ReviewDb, StaleReview, ViewedTarget, bump_revision, ensure_durable,
+    preserve_review_coverage_baseline_connection, read_session, record_review_coverage_connection,
+    require_revision, retain, review_coverage_revision_connection,
+    revoke_review_coverage_connection,
 };
 use crate::{
     github_review::{RemoteViewedFile, ReviewContext, ViewedState},
@@ -485,6 +486,7 @@ impl ReviewDb {
                         comparison.validate_retained(&bytes, budget)?;
                         let checkpoint = ReviewedCheckpoint { group:group.clone(), comparison, generation:session.snapshot.generation, reviewed_at_unix_seconds:timestamp };
                         if inferred {
+                            preserve_review_coverage_baseline_connection(connection, &session, &group, path)?;
                             connection.exec_bound::<(String,String,String)>("INSERT INTO review_coverage_promotions(session_id,file_key,fingerprint) VALUES (?,?,?) ON CONFLICT(session_id,file_key) DO UPDATE SET fingerprint=excluded.fingerprint")?((session.id.clone(),path.clone(),intent.fingerprints[path].clone()))?;
                         } else {
                             record_review_coverage_connection(connection, &session, &group, path)?;
