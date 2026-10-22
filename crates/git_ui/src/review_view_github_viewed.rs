@@ -962,7 +962,7 @@ fn viewed_delivery_batch(
     Ok(batch)
 }
 
-fn enqueue_viewed_delivery(
+pub(super) fn enqueue_viewed_delivery(
     db: ReviewDb,
     operation: ReviewOperation,
     remote: ReviewContext,
@@ -1101,14 +1101,14 @@ fn enqueue_viewed_delivery(
     )
 }
 
-fn sync_target(session: &ReviewSession, revision: u64) -> GitHubViewedSyncTarget {
+pub(super) fn sync_target(session: &ReviewSession, revision: u64) -> GitHubViewedSyncTarget {
     GitHubViewedSyncTarget {
         session: session.id.clone(),
         expected_revision: revision,
         displayed_generation: session.snapshot.generation,
     }
 }
-fn viewed_intent(
+pub(super) fn viewed_intent(
     session: &ReviewSession,
     paths: Vec<String>,
     viewed: bool,
@@ -1139,7 +1139,7 @@ fn viewed_intent(
     intent.validate_for(session)?;
     Ok(intent)
 }
-async fn retained_comparison(
+pub(super) async fn retained_comparison(
     repository: &Entity<Repository>,
     comparison: &FileComparison,
     budget: usize,

@@ -60,6 +60,7 @@ pub mod repository_selector;
 pub mod review;
 mod review_comment_anchor;
 mod review_commit_picker;
+mod review_coverage;
 mod review_github_view;
 pub mod review_github_viewed;
 mod review_outbox_runtime;

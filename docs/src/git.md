@@ -362,6 +362,20 @@ In Files changed, All commits opens the commit picker. Select commits to narrow
 the comparison, or clear the selection to return to the full pull request.
 Commit selection does not change the checked-out branch or rewrite commits.
 
+Use **Mark selected commits reviewed** to record every file comparison in the
+selection, including files you have not opened. A selected file's **Reviewed**
+checkbox records that comparison only. Reviewed comparisons accumulate locally
+across selections and restarts. A file becomes **Viewed** for the complete pull
+request and syncs to GitHub only when recorded comparisons cover its changes
+from the original PR file version through the current head without gaps.
+Unrelated intervening commits do not leave a gap for that file.
+
+If a comparison is unmarked, an approval inferred from those comparisons is
+withdrawn when coverage is incomplete. An explicit full-file Viewed approval is
+independent. Changed bases, rewritten history and unverified rename chains do
+not silently reuse review coverage. Open and refresh All PR changes before
+synchronizing a selected-commit review against a newer PR revision.
+
 ### Reviewing Files
 
 Files changed provides a searchable tree, split or unified diffs, and file and

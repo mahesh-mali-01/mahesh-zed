@@ -2,7 +2,8 @@
 //! Every write uses the full PR's account/clone/session and pinned-generation CAS.
 use super::{
     ReviewDb, StaleReview, ViewedTarget, bump_revision, ensure_durable, read_session,
-    require_revision, retain,
+    record_review_coverage_connection, require_revision, retain,
+    review_coverage_revision_connection, revoke_review_coverage_connection,
 };
 use crate::{
     github_review::{RemoteViewedFile, ReviewContext, ViewedState},
@@ -419,16 +420,58 @@ impl ReviewDb {
         &self,
         target: GitHubViewedSyncTarget,
         context: ReviewOperationContext,
+        intent: GitHubViewedIntent,
+        contents: BTreeMap<String, RetainedContents>,
+        existing: Option<ReviewOperation>,
+        budget: usize,
+    ) -> Result<(ReviewOperation, u64)> {
+        self.accept_github_viewed_intent_inner(
+            target, context, intent, contents, existing, budget, None,
+        )
+        .await
+    }
+
+    pub async fn accept_covered_github_viewed_intent(
+        &self,
+        target: GitHubViewedSyncTarget,
+        context: ReviewOperationContext,
+        intent: GitHubViewedIntent,
+        contents: BTreeMap<String, RetainedContents>,
+        existing: Option<ReviewOperation>,
+        budget: usize,
+        expected_coverage_revision: u64,
+    ) -> Result<(ReviewOperation, u64)> {
+        self.accept_github_viewed_intent_inner(
+            target,
+            context,
+            intent,
+            contents,
+            existing,
+            budget,
+            Some(expected_coverage_revision),
+        )
+        .await
+    }
+
+    async fn accept_github_viewed_intent_inner(
+        &self,
+        target: GitHubViewedSyncTarget,
+        context: ReviewOperationContext,
         mut intent: GitHubViewedIntent,
         mut contents: BTreeMap<String, RetainedContents>,
         existing: Option<ReviewOperation>,
         budget: usize,
+        expected_coverage_revision: Option<u64>,
     ) -> Result<(ReviewOperation, u64)> {
         self.write(move |connection| {
             ensure_durable(connection)?;
             connection.with_savepoint("review_github_viewed_accept", || {
                 let session = read_session(connection, &target.session)?;
                 require_revision(&session, target.expected_revision, target.displayed_generation)?;
+                if let Some(expected) = expected_coverage_revision {
+                    if review_coverage_revision_connection(connection, &session)? != expected { anyhow::bail!(StaleReview); }
+                }
+                let inferred = expected_coverage_revision.is_some();
                 context.validate()?;
                 ensure!(context.selector == session.selector && context.metadata == metadata(connection, &session)?, "Viewed context changed before local acceptance");
                 intent.validate_for(&session)?;
@@ -441,10 +484,21 @@ impl ReviewDb {
                         let bytes = contents.remove(path).context("Reviewed contents are missing")?;
                         comparison.validate_retained(&bytes, budget)?;
                         let checkpoint = ReviewedCheckpoint { group:group.clone(), comparison, generation:session.snapshot.generation, reviewed_at_unix_seconds:timestamp };
+                        if inferred {
+                            connection.exec_bound::<(String,String,String)>("INSERT INTO review_coverage_promotions(session_id,file_key,fingerprint) VALUES (?,?,?) ON CONFLICT(session_id,file_key) DO UPDATE SET fingerprint=excluded.fingerprint")?((session.id.clone(),path.clone(),intent.fingerprints[path].clone()))?;
+                        } else {
+                            record_review_coverage_connection(connection, &session, &group, path)?;
+                        }
                         let old = retain(connection, bytes.old)?;
                         let new = retain(connection, bytes.new)?;
                         connection.exec_bound::<(String,String,String,i64,String,Option<String>,Option<String>)>("INSERT INTO review_checkpoints(session_id,group_id,file_key,generation,checkpoint,old_content,new_content) VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_id,group_id,file_key) DO UPDATE SET generation=excluded.generation,checkpoint=excluded.checkpoint,old_content=excluded.old_content,new_content=excluded.new_content")?((session.id.clone(),group.clone(),path.clone(),session.snapshot.generation as i64,serde_json::to_string(&checkpoint)?,old,new))?;
                     } else {
+                        if inferred {
+                            let promotion=connection.select_row_bound::<(String,String),String>("SELECT fingerprint FROM review_coverage_promotions WHERE session_id=? AND file_key=?")?((session.id.clone(),path.clone()))?;
+                            ensure!(promotion.as_ref()==intent.fingerprints.get(path), "Only coverage-owned Viewed state can be revoked automatically");
+                        } else {
+                            revoke_review_coverage_connection(connection, &session, &group, path)?;
+                        }
                         connection.exec_bound::<(String,String,String)>("DELETE FROM review_checkpoints WHERE session_id = ? AND group_id = ? AND file_key = ?")?((session.id.clone(),group.clone(),path.clone()))?;
                     }
                 }

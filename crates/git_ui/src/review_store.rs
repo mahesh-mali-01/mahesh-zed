@@ -125,6 +125,32 @@ impl Domain for ReviewDb {
             PRIMARY KEY(repository_id, identity)
         ) STRICT;
     "#,
+        r#"
+        CREATE TABLE review_coverage (
+            repository_id TEXT NOT NULL REFERENCES review_repositories(id),
+            identity TEXT NOT NULL,
+            base_tip TEXT NOT NULL,
+            file_key TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            left_oid TEXT NOT NULL,
+            right_oid TEXT NOT NULL,
+            comparison TEXT NOT NULL,
+            PRIMARY KEY(repository_id, identity, base_tip, file_key, fingerprint, left_oid, right_oid)
+        ) STRICT;
+        CREATE TABLE review_coverage_revisions (
+            repository_id TEXT NOT NULL REFERENCES review_repositories(id),
+            identity TEXT NOT NULL,
+            base_tip TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            PRIMARY KEY(repository_id, identity, base_tip)
+        ) STRICT;
+        CREATE TABLE review_coverage_promotions (
+            session_id TEXT NOT NULL REFERENCES review_sessions(id),
+            file_key TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            PRIMARY KEY(session_id, file_key)
+        ) STRICT;
+    "#,
     ];
 }
 
@@ -636,6 +662,7 @@ impl ReviewDb {
                 let checkpoint = ReviewedCheckpoint { group: target.group.clone(), comparison,
                     generation: target.displayed_generation,
                     reviewed_at_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() };
+                record_review_coverage_connection(connection, &session, &target.group, &target.path)?;
                 let old_content = retain(connection, contents.old)?;
                 let new_content = retain(connection, contents.new)?;
                 connection.exec_bound::<(String, String, String, i64, String, Option<String>, Option<String>)>(
@@ -739,6 +766,7 @@ impl ReviewDb {
                 if session.snapshot.file(&target.group, &target.path)?.fingerprint()? != target.fingerprint {
                     anyhow::bail!(StaleReview);
                 }
+                revoke_review_coverage_connection(connection, &session, &target.group, &target.path)?;
                 connection.exec_bound::<(String, String, String)>(
                     "DELETE FROM review_checkpoints WHERE session_id = ? AND group_id = ? AND file_key = ?",
                 )?((target.session, target.group, target.path))?;
@@ -799,7 +827,7 @@ impl ReviewDb {
 
 #[path = "review_github_viewed_store.rs"]
 mod github_viewed;
-pub use github_viewed::{GitHubViewedIntent, GitHubViewedSyncResult, GitHubViewedSyncTarget};
+pub use github_viewed::{GitHubViewedIntent, GitHubViewedSyncTarget};
 
 #[path = "review_outbox_store.rs"]
 mod outbox;
@@ -810,3 +838,547 @@ mod outbox_tests;
 #[cfg(test)]
 #[path = "review_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_coverage_store_tests.rs"]
+mod coverage_tests;
+
+/// Read the verified PR base context rather than using display names as identity.
+fn review_coverage_context(
+    connection: &Connection,
+    session: &ReviewSession,
+) -> Result<Option<(String, String)>> {
+    let Some(identity) = session.selector.pull_request_identity() else {
+        return Ok(None);
+    };
+    identity.validate()?;
+    let json = connection.select_row_bound::<String, String>(
+        "SELECT metadata FROM review_pull_requests WHERE session_id = ?",
+    )?(session.id.clone())?
+    .context("PR coverage metadata is unavailable")?;
+    let metadata: PullRequestMetadata = serde_json::from_str(&json)?;
+    metadata.validate_pinned_tips(session.repository.format)?;
+    if let ComparisonSelector::PullRequestScope {
+        base_tip, head_tip, ..
+    } = &session.selector
+    {
+        ensure!(
+            metadata.base_ref_oid == base_tip.hex && metadata.head_ref_oid == head_tip.hex,
+            "PR coverage scope changed"
+        );
+    }
+    Ok(Some((
+        serde_json::to_string(identity)?,
+        metadata.base_ref_oid,
+    )))
+}
+
+/// Shared by checkpoint and queued full-file Viewed acceptance transactions.
+/// Metadata-only receipts do not duplicate retained file contents.
+pub(super) fn record_review_coverage_connection(
+    connection: &Connection,
+    session: &ReviewSession,
+    group: &str,
+    path: &str,
+) -> Result<()> {
+    // Historical-schema migration fixtures exercise the old checkpoint writer.
+    if connection.select_row::<i64>(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_coverage'",
+    )?()?
+    .is_none()
+    {
+        return Ok(());
+    }
+    let Some((identity, base_tip)) = review_coverage_context(connection, session)? else {
+        return Ok(());
+    };
+    connection.exec_bound::<(String,String,String)>(
+        "INSERT INTO review_coverage_revisions(repository_id,identity,base_tip,revision) VALUES (?,?,?,1) ON CONFLICT(repository_id,identity,base_tip) DO UPDATE SET revision=revision+1",
+    )?((session.repository.id.clone(),identity.clone(),base_tip.clone()))?;
+    ensure!(
+        session.snapshot.incomplete_reason.is_none(),
+        "Incomplete coverage snapshot"
+    );
+    if session.selector.supports_github_viewed() {
+        connection.exec_bound::<(String, String)>(
+            "DELETE FROM review_coverage_promotions WHERE session_id=? AND file_key=?",
+        )?((session.id.clone(), path.to_owned()))?;
+    }
+    let comparison = session.snapshot.file(group, path)?;
+    let endpoints = &session
+        .snapshot
+        .groups
+        .iter()
+        .find(|entry| entry.endpoints.group == group)
+        .context("Coverage group missing")?
+        .endpoints;
+    connection.exec_bound::<(String, String, String, String, String, String, String, String)>(
+        "INSERT OR IGNORE INTO review_coverage(repository_id,identity,base_tip,file_key,fingerprint,left_oid,right_oid,comparison) VALUES (?,?,?,?,?,?,?,?)",
+    )?((session.repository.id.clone(), identity, base_tip, path.to_owned(), comparison.fingerprint()?, endpoints.left.hex.clone(), endpoints.right.hex.clone(), serde_json::to_string(comparison)?))?;
+    Ok(())
+}
+
+/// A full-PR unmark deliberately clears all accumulated coverage for this file.
+/// Unmarking a selected comparison revokes that comparison's receipts only.
+pub(super) fn revoke_review_coverage_connection(
+    connection: &Connection,
+    session: &ReviewSession,
+    group: &str,
+    path: &str,
+) -> Result<()> {
+    // Historical-schema migration fixtures exercise the old checkpoint writer.
+    if connection.select_row::<i64>(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_coverage'",
+    )?()?
+    .is_none()
+    {
+        return Ok(());
+    }
+    let Some((identity, base_tip)) = review_coverage_context(connection, session)? else {
+        return Ok(());
+    };
+    connection.exec_bound::<(String,String,String)>(
+        "INSERT INTO review_coverage_revisions(repository_id,identity,base_tip,revision) VALUES (?,?,?,1) ON CONFLICT(repository_id,identity,base_tip) DO UPDATE SET revision=revision+1",
+    )?((session.repository.id.clone(),identity.clone(),base_tip.clone()))?;
+    if session.selector.supports_github_viewed() {
+        connection.exec_bound::<(String, String)>(
+            "DELETE FROM review_coverage_promotions WHERE session_id=? AND file_key=?",
+        )?((session.id.clone(), path.to_owned()))?;
+        connection.exec_bound::<(String, String, String)>(
+            "DELETE FROM review_coverage WHERE repository_id = ? AND identity = ? AND file_key = ?",
+        )?((session.repository.id.clone(), identity, path.to_owned()))?;
+    } else {
+        let fingerprint = session.snapshot.file(group, path)?.fingerprint()?;
+        connection.exec_bound::<(String, String, String, String, String)>(
+            "DELETE FROM review_coverage WHERE repository_id = ? AND identity = ? AND base_tip = ? AND file_key = ? AND fingerprint = ?",
+        )?((session.repository.id.clone(), identity, base_tip, path.to_owned(), fingerprint))?;
+    }
+    Ok(())
+}
+
+impl ReviewDb {
+    /// Record explicit review of a comparison without loading or retaining its
+    /// contents. Used by the deliberate bulk selected-commit review action.
+    #[cfg(test)]
+    pub async fn record_review_coverage(&self, target: ViewedTarget) -> Result<u64> {
+        self.set_review_coverage(vec![target], true).await
+    }
+
+    #[cfg(test)]
+    pub async fn revoke_review_coverage(&self, target: ViewedTarget) -> Result<u64> {
+        self.set_review_coverage(vec![target], false).await
+    }
+
+    /// Evaluate a canonical full-PR file against receipts in the *current*
+    /// verified ancestry. Callers must derive the set from pinned Git membership,
+    /// including valid parent endpoints; stale/rebased receipts cannot grant
+    /// approval merely because their blob bytes happen to match.
+    #[cfg(test)]
+    pub fn reviewed_file_coverage(
+        &self,
+        canonical: &ReviewSession,
+        path: &str,
+        verified_commits: &std::collections::BTreeSet<String>,
+    ) -> Result<bool> {
+        Ok(self
+            .reviewed_files_coverage(
+                canonical,
+                &std::collections::BTreeSet::from([path.to_owned()]),
+                verified_commits,
+            )?
+            .contains(path))
+    }
+    /// Evaluate many canonical paths with one identity/receipt/checkpoint read.
+    /// Historical manifests are decoded once per referenced generation.
+    pub fn reviewed_files_coverage(
+        &self,
+        canonical: &ReviewSession,
+        paths: &std::collections::BTreeSet<String>,
+        verified_commits: &std::collections::BTreeSet<String>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        use std::collections::{BTreeMap, BTreeSet};
+        ensure_durable(self)?;
+        let current = read_session(self, &canonical.id)?;
+        require_revision(&current, canonical.revision, canonical.snapshot.generation)?;
+        ensure!(
+            canonical.selector.supports_github_viewed()
+                && canonical.snapshot.incomplete_reason.is_none()
+                && canonical.snapshot.groups.len() == 1,
+            "Coverage requires a complete canonical PR"
+        );
+        let (identity, base_tip) =
+            review_coverage_context(self, canonical)?.context("Coverage requires a PR")?;
+        let group = &canonical.snapshot.groups[0];
+        ensure!(
+            verified_commits.contains(&group.endpoints.left.hex)
+                && verified_commits.contains(&group.endpoints.right.hex),
+            "Coverage ancestry excludes canonical endpoints"
+        );
+        let comparisons = group
+            .files
+            .iter()
+            .map(|file| Ok((file.file_key()?.to_owned(), file)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        for path in paths {
+            ensure!(
+                comparisons.contains_key(path),
+                "Coverage file is absent from canonical snapshot"
+            );
+        }
+        let rows = self.select_bound::<(String, String, String), (String, String, String, String)>(
+            "SELECT file_key,left_oid,right_oid,comparison FROM review_coverage WHERE repository_id = ? AND identity = ? AND base_tip = ?",
+        )?((canonical.repository.id.clone(), identity, base_tip))?;
+        let mut receipts: BTreeMap<String, Vec<FileComparison>> = BTreeMap::new();
+        for (path, left, right, json) in rows {
+            if paths.contains(&path)
+                && verified_commits.contains(&left)
+                && verified_commits.contains(&right)
+            {
+                let comparison: FileComparison = serde_json::from_str(&json)?;
+                ensure!(
+                    comparison.file_key()? == path,
+                    "Coverage receipt identity is corrupt"
+                );
+                receipts.entry(path).or_default().push(comparison);
+            }
+        }
+        let promotions = self.select_bound::<String, (String, String)>(
+            "SELECT file_key,fingerprint FROM review_coverage_promotions WHERE session_id=?",
+        )?(canonical.id.clone())?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let checkpoints = self.select_bound::<String, (String, i64, String)>(
+            "SELECT file_key,generation,checkpoint FROM review_checkpoints WHERE session_id=?",
+        )?(canonical.id.clone())?;
+        let manifests = self.select_bound::<String, (i64, String)>(
+            "SELECT DISTINCT m.generation,m.manifest FROM review_snapshots m JOIN review_checkpoints c ON c.session_id=m.session_id AND c.generation=m.generation WHERE c.session_id=?",
+        )?(canonical.id.clone())?;
+        let mut snapshots = BTreeMap::new();
+        let requested_generations = checkpoints
+            .iter()
+            .filter(|(path, _, _)| paths.contains(path))
+            .map(|(_, generation, _)| *generation)
+            .collect::<BTreeSet<_>>();
+        for (generation, json) in manifests {
+            if !requested_generations.contains(&generation) {
+                continue;
+            }
+            let snapshot: ReviewSnapshot = serde_json::from_str(&json)?;
+            snapshot.validate(canonical.repository.format)?;
+            ensure!(
+                snapshot.generation == generation as u64,
+                "Coverage checkpoint generation is corrupt"
+            );
+            snapshots.insert(generation, snapshot);
+        }
+        // Retained full checkpoints are trusted review baselines; a server
+        // Viewed flag alone never manufactures a transition receipt.
+        for (path, generation, json) in checkpoints {
+            if !paths.contains(&path) {
+                continue;
+            }
+            let checkpoint: ReviewedCheckpoint = serde_json::from_str(&json)?;
+            if promotions.get(&path) == Some(&checkpoint.comparison.fingerprint()?) {
+                continue;
+            }
+            let snapshot = snapshots
+                .get(&generation)
+                .context("Coverage checkpoint snapshot missing")?;
+            let comparison = comparisons[&path];
+            if let Some(previous) = snapshot
+                .groups
+                .iter()
+                .find(|entry| entry.endpoints.group == checkpoint.group)
+                && previous.endpoints.left == group.endpoints.left
+                && verified_commits.contains(&previous.endpoints.right.hex)
+                && checkpoint.comparison.old == comparison.old
+                && checkpoint.comparison.file_key()? == path
+                && checkpoint.generation == generation as u64
+                && previous
+                    .files
+                    .iter()
+                    .any(|file| file == &checkpoint.comparison)
+            {
+                receipts
+                    .entry(path)
+                    .or_default()
+                    .push(checkpoint.comparison);
+            }
+        }
+        let mut covered = BTreeSet::new();
+        for path in paths {
+            if crate::review_coverage::covers_file(
+                comparisons[path],
+                receipts.get(path).map(Vec::as_slice).unwrap_or_default(),
+            )? {
+                covered.insert(path.clone());
+            }
+        }
+        Ok(covered)
+    }
+
+    /// Exact local progress for all displayed comparisons, loaded in one batch.
+    pub fn comparison_reviewed_paths(
+        &self,
+        session: &ReviewSession,
+    ) -> Result<std::collections::BTreeSet<(String, String)>> {
+        use std::collections::{BTreeMap, BTreeSet};
+        ensure_durable(self)?;
+        let current = read_session(self, &session.id)?;
+        require_revision(&current, session.revision, session.snapshot.generation)?;
+        let Some((identity, base_tip)) = review_coverage_context(self, session)? else {
+            return Ok(BTreeSet::new());
+        };
+        let mut expected = BTreeMap::new();
+        for group in &session.snapshot.groups {
+            for comparison in &group.files {
+                let path = comparison.file_key()?.to_owned();
+                expected.insert(
+                    (
+                        path,
+                        comparison.fingerprint()?,
+                        group.endpoints.left.hex.clone(),
+                        group.endpoints.right.hex.clone(),
+                    ),
+                    (group.endpoints.group.clone(), comparison),
+                );
+            }
+        }
+        let rows = self.select_bound::<(String, String, String), (String, String, String, String, String)>(
+            "SELECT file_key,fingerprint,left_oid,right_oid,comparison FROM review_coverage WHERE repository_id=? AND identity=? AND base_tip=?",
+        )?((session.repository.id.clone(), identity, base_tip))?;
+        let mut reviewed = BTreeSet::new();
+        for (path, fingerprint, left, right, json) in rows {
+            if let Some((group, comparison)) =
+                expected.get(&(path.clone(), fingerprint, left, right))
+            {
+                let recorded: FileComparison = serde_json::from_str(&json)?;
+                ensure!(
+                    recorded == **comparison,
+                    "Coverage receipt comparison is corrupt"
+                );
+                reviewed.insert((group.clone(), path));
+            }
+        }
+        Ok(reviewed)
+    }
+}
+
+impl ReviewDb {
+    /// Local selected-comparison progress also applies to metadata-only bulk
+    /// review receipts. Never infer this from another comparison's file path.
+    #[cfg(test)]
+    pub fn comparison_reviewed(
+        &self,
+        session: &ReviewSession,
+        group: &str,
+        path: &str,
+    ) -> Result<bool> {
+        ensure_durable(self)?;
+        let current = read_session(self, &session.id)?;
+        require_revision(&current, session.revision, session.snapshot.generation)?;
+        let Some((identity, base_tip)) = review_coverage_context(self, session)? else {
+            return Ok(false);
+        };
+        let comparison = session.snapshot.file(group, path)?;
+        let endpoints = &session
+            .snapshot
+            .groups
+            .iter()
+            .find(|entry| entry.endpoints.group == group)
+            .context("Coverage group missing")?
+            .endpoints;
+        let json = self.select_row_bound::<(String, String, String, String, String, String, String), String>(
+            "SELECT comparison FROM review_coverage WHERE repository_id=? AND identity=? AND base_tip=? AND file_key=? AND fingerprint=? AND left_oid=? AND right_oid=?",
+        )?((session.repository.id.clone(), identity, base_tip, path.to_owned(), comparison.fingerprint()?, endpoints.left.hex.clone(), endpoints.right.hex.clone()))?;
+        let Some(json) = json else {
+            return Ok(false);
+        };
+        let recorded: FileComparison = serde_json::from_str(&json)?;
+        ensure!(
+            recorded == *comparison,
+            "Coverage receipt comparison is corrupt"
+        );
+        Ok(true)
+    }
+}
+
+impl ReviewDb {
+    /// Canonical Viewed state owned by inferred selected-comparison coverage,
+    /// rather than an explicit full-file user review.
+    pub fn coverage_promoted_paths(
+        &self,
+        session: &ReviewSession,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        ensure_durable(self)?;
+        let current = read_session(self, &session.id)?;
+        require_revision(&current, session.revision, session.snapshot.generation)?;
+        ensure!(
+            session.selector.supports_github_viewed() && session.snapshot.groups.len() == 1,
+            "Coverage promotions require a canonical PR"
+        );
+        let rows = self.select_bound::<String, (String, String)>(
+            "SELECT file_key,fingerprint FROM review_coverage_promotions WHERE session_id=?",
+        )?(session.id.clone())?;
+        let group = &session.snapshot.groups[0];
+        let fingerprints = group
+            .files
+            .iter()
+            .map(|file| Ok((file.file_key()?.to_owned(), file.fingerprint()?)))
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(path, fingerprint)| {
+                (fingerprints.get(&path) == Some(&fingerprint)).then_some(path)
+            })
+            .collect())
+    }
+}
+
+impl ReviewDb {
+    /// Explicit bulk review is one compare-and-swap transaction. A stale target
+    /// cannot leave a partially acknowledged commit behind.
+    pub async fn set_review_coverage(
+        &self,
+        targets: Vec<ViewedTarget>,
+        reviewed: bool,
+    ) -> Result<u64> {
+        self.set_review_coverage_inner(targets, reviewed, None, usize::MAX)
+            .await
+    }
+
+    /// Manual file review retains exact displayed contents for immutable reopen
+    /// and since-review navigation, alongside the accumulated coverage receipt.
+    pub async fn set_review_coverage_with_contents(
+        &self,
+        targets: Vec<ViewedTarget>,
+        reviewed: bool,
+        contents: std::collections::BTreeMap<(String, String), RetainedContents>,
+        budget: usize,
+    ) -> Result<u64> {
+        self.set_review_coverage_inner(targets, reviewed, Some(contents), budget)
+            .await
+    }
+
+    async fn set_review_coverage_inner(
+        &self,
+        targets: Vec<ViewedTarget>,
+        reviewed: bool,
+        mut contents: Option<std::collections::BTreeMap<(String, String), RetainedContents>>,
+        budget: usize,
+    ) -> Result<u64> {
+        self.write(move |connection| {
+            ensure_durable(connection)?;
+            connection.with_savepoint("review_coverage_batch", || {
+                let first = targets
+                    .first()
+                    .context("Coverage batch contains no comparisons")?;
+                let session = read_session(connection, &first.session)?;
+                require_revision(
+                    &session,
+                    first.expected_revision,
+                    first.displayed_generation,
+                )?;
+                ensure!(
+                    session.selector.pull_request_identity().is_some()
+                        && session.snapshot.incomplete_reason.is_none(),
+                    "Coverage requires a complete PR comparison"
+                );
+                if let Some(contents) = &contents {
+                    ensure!(contents.len() == if reviewed { targets.len() } else { 0 }, "Retained contents do not match coverage targets");
+                }
+                let mut unique = std::collections::BTreeSet::new();
+                for target in &targets {
+                    ensure!(
+                        target.session == session.id,
+                        "Coverage batch contains multiple sessions"
+                    );
+                    require_revision(
+                        &session,
+                        target.expected_revision,
+                        target.displayed_generation,
+                    )?;
+                    ensure!(
+                        unique.insert((&target.group, &target.path)),
+                        "Coverage batch contains duplicate comparisons"
+                    );
+                    if session
+                        .snapshot
+                        .file(&target.group, &target.path)?
+                        .fingerprint()?
+                        != target.fingerprint
+                    {
+                        anyhow::bail!(StaleReview);
+                    }
+                }
+                if reviewed {
+                    if let Some(contents) = &contents {
+                        for target in &targets {
+                            let bytes = contents.get(&(target.group.clone(), target.path.clone())).context("Reviewed contents are missing")?;
+                            session.snapshot.file(&target.group, &target.path)?.validate_retained(bytes, budget)?;
+                        }
+                    }
+                }
+                let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                for target in &targets {
+                    if reviewed {
+                        if let Some(contents) = &mut contents {
+                            let bytes = contents.remove(&(target.group.clone(), target.path.clone())).context("Reviewed contents are missing")?;
+                            let checkpoint = ReviewedCheckpoint {
+                                group: target.group.clone(),
+                                comparison: session.snapshot.file(&target.group, &target.path)?.clone(),
+                                generation: session.snapshot.generation,
+                                reviewed_at_unix_seconds: timestamp,
+                            };
+                            let old = retain(connection, bytes.old)?;
+                            let new = retain(connection, bytes.new)?;
+                            connection.exec_bound::<(String,String,String,i64,String,Option<String>,Option<String>)>("INSERT INTO review_checkpoints(session_id,group_id,file_key,generation,checkpoint,old_content,new_content) VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_id,group_id,file_key) DO UPDATE SET generation=excluded.generation,checkpoint=excluded.checkpoint,old_content=excluded.old_content,new_content=excluded.new_content")?((session.id.clone(),target.group.clone(),target.path.clone(),session.snapshot.generation as i64,serde_json::to_string(&checkpoint)?,old,new))?;
+                        }
+                        record_review_coverage_connection(
+                            connection,
+                            &session,
+                            &target.group,
+                            &target.path,
+                        )?;
+                    } else {
+                        revoke_review_coverage_connection(
+                            connection,
+                            &session,
+                            &target.group,
+                            &target.path,
+                        )?;
+                        connection.exec_bound::<(String,String,String)>("DELETE FROM review_checkpoints WHERE session_id=? AND group_id=? AND file_key=?")?((session.id.clone(),target.group.clone(),target.path.clone()))?;
+                    }
+                }
+                bump_revision(connection, &session)
+            })
+        })
+        .await
+    }
+}
+
+pub(super) fn review_coverage_revision_connection(
+    connection: &Connection,
+    session: &ReviewSession,
+) -> Result<u64> {
+    let (identity, base_tip) =
+        review_coverage_context(connection, session)?.context("Coverage requires a PR")?;
+    let revision = connection.select_row_bound::<(String,String,String),i64>("SELECT revision FROM review_coverage_revisions WHERE repository_id=? AND identity=? AND base_tip=?")?((session.repository.id.clone(),identity,base_tip))?.unwrap_or(0);
+    ensure!(revision >= 0, "Coverage revision is corrupt");
+    Ok(revision as u64)
+}
+
+impl ReviewDb {
+    /// Capture before evaluating coverage; inferred acceptance verifies this
+    /// shared PR epoch atomically against concurrent reviews in other scopes.
+    pub fn review_coverage_revision(&self, canonical: &ReviewSession) -> Result<u64> {
+        ensure_durable(self)?;
+        let current = read_session(self, &canonical.id)?;
+        require_revision(&current, canonical.revision, canonical.snapshot.generation)?;
+        ensure!(
+            canonical.selector.supports_github_viewed(),
+            "Coverage epoch requires a canonical PR"
+        );
+        review_coverage_revision_connection(self, canonical)
+    }
+}

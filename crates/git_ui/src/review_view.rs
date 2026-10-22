@@ -106,6 +106,8 @@ actions!(
 #[path = "review_view_github_viewed.rs"]
 mod github_viewed;
 
+#[path = "review_view_coverage.rs"]
+mod coverage;
 mod presentation;
 
 const GROUP: &str = "comparison";
@@ -161,6 +163,14 @@ fn read_data(db: &ReviewDb, session: ReviewSession) -> Result<ReviewData> {
             .first()
             .map(|group| group.endpoints.group.clone());
     }
+    let coverage_reviews = if matches!(
+        session.selector,
+        ComparisonSelector::PullRequestScope { .. }
+    ) {
+        db.comparison_reviewed_paths(&session)?
+    } else {
+        BTreeSet::new()
+    };
     let mut group_progress = Vec::new();
     for group in &session.snapshot.groups {
         let active = matches!(
@@ -182,7 +192,8 @@ fn read_data(db: &ReviewDb, session: ReviewSession) -> Result<ReviewData> {
             let checkpoint_reviewed = checkpoint
                 .map(|checkpoint| checkpoint.matches(&group.endpoints.group, file))
                 .transpose()?
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || coverage_reviews.contains(&(group.endpoints.group.clone(), path.to_owned()));
             let reviewed = overrides.get(path).copied().unwrap_or(checkpoint_reviewed);
             count += usize::from(reviewed);
             if !active {
@@ -210,14 +221,16 @@ fn read_data(db: &ReviewDb, session: ReviewSession) -> Result<ReviewData> {
                     .iter()
                     .find(|file| file.file_key().ok() == Some(path.as_str()))
                     .is_none_or(|file| {
-                        db.checkpoint(&session.id, &group.endpoints.group, path)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|(checkpoint, _)| {
-                                checkpoint
-                                    .matches(&group.endpoints.group, file)
-                                    .unwrap_or(false)
-                            })
+                        coverage_reviews.contains(&(group.endpoints.group.clone(), path.to_owned()))
+                            || db
+                                .checkpoint(&session.id, &group.endpoints.group, path)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|(checkpoint, _)| {
+                                    checkpoint
+                                        .matches(&group.endpoints.group, file)
+                                        .unwrap_or(false)
+                                })
                     })
             })
         });
@@ -1040,6 +1053,32 @@ pub struct ReviewView {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Isolate the full checkbox gesture, including when disabled, from row/editor actions.
+fn review_checkbox(
+    id: impl Into<gpui::ElementId>,
+    checkbox: Checkbox,
+    disabled: bool,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    h_flex()
+        .id(id)
+        .debug_selector(|| "REVIEW_CHECKBOX_TARGET".into())
+        .flex_none()
+        .min_w(px(24.))
+        .min_h(px(24.))
+        .justify_center()
+        .block_mouse_except_scroll()
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            if !disabled {
+                on_click(window, cx);
+            }
+        })
+        .child(checkbox.disabled(disabled))
+}
+
 struct ReviewFileHeaderAddon {
     review: WeakEntity<ReviewView>,
 }
@@ -1070,32 +1109,34 @@ impl editor::Addon for ReviewFileHeaderAddon {
             || (!full_pr && !is_selected);
         let review = self.review.clone();
         Some(
-            Checkbox::new(
-                gpui::SharedString::from(format!("review-header-viewed-{path}")),
-                viewed.into(),
+            review_checkbox(
+                gpui::SharedString::from(format!("review-header-viewed-target-{path}")),
+                Checkbox::new(
+                    gpui::SharedString::from(format!("review-header-viewed-{path}")),
+                    viewed.into(),
+                )
+                .fill()
+                .style(ui::ToggleStyle::Custom(cx.theme().colors().text))
+                .label(if full_pr { "Viewed" } else { "Reviewed" }),
+                disabled,
+                move |window, cx| {
+                    review
+                        .update(cx, |view, cx| {
+                            if full_pr {
+                                view.set_github_paths_viewed(
+                                    vec![path.clone()],
+                                    !viewed,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                view.toggle_viewed(&ToggleReviewViewed, window, cx);
+                            }
+                        })
+                        .log_err();
+                },
             )
-            .fill()
-            .style(ui::ToggleStyle::Custom(cx.theme().colors().text))
-            .label(if full_pr { "Viewed" } else { "Reviewed" })
-            .disabled(disabled)
-            .on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                review
-                    .update(cx, |view, cx| {
-                        if full_pr {
-                            view.set_github_paths_viewed(
-                                vec![path.clone()],
-                                !viewed,
-                                None,
-                                window,
-                                cx,
-                            );
-                        } else {
-                            view.toggle_viewed(&ToggleReviewViewed, window, cx);
-                        }
-                    })
-                    .log_err();
-            })
             .into_any_element(),
         )
     }
@@ -2308,6 +2349,7 @@ impl ReviewView {
         context: PullRequestReviewContext,
         selections: Vec<git::review::ReviewCommitSelection>,
         range: bool,
+        mark_reviewed: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -2375,7 +2417,18 @@ impl ReviewView {
                     })
                     .await?;
                 weak.update_in(cx, |workspace, window, cx| {
-                    Self::show_data(workspace, project, repository, db, data, window, cx)
+                    let id = data.session.id.clone();
+                    Self::show_data(workspace, project, repository, db, data, window, cx);
+                    if mark_reviewed {
+                        let view = workspace
+                            .items_of_type::<Self>(cx)
+                            .find(|view| view.read(cx).data.session.id == id);
+                        if let Some(view) = view {
+                            view.update(cx, |view, cx| {
+                                view.mark_selected_commits_reviewed(window, cx)
+                            });
+                        }
+                    }
                 })?;
                 anyhow::Ok(())
             })
@@ -4342,6 +4395,14 @@ impl ReviewView {
         if matches!(
             self.data.session.selector,
             ComparisonSelector::PullRequestScope { .. }
+        ) {
+            let reviewed = !self.data.viewed.contains(&path);
+            self.review_commit_paths(vec![path], reviewed, true, window, cx);
+            return;
+        }
+        if matches!(
+            self.data.session.selector,
+            ComparisonSelector::PullRequestScope { .. }
         ) && self.data.session.snapshot.groups.len() > 1
         {
             let patches = self.selected_patch_contents.clone();
@@ -4896,3 +4957,7 @@ impl SerializableItem for ReviewView {
 #[cfg(test)]
 #[path = "review_view_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_checkbox_tests.rs"]
+mod checkbox_tests;

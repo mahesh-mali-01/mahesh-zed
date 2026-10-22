@@ -296,8 +296,8 @@ impl ComparisonSelector {
             _ => None,
         }
     }
-    /// Only a full PR comparison can synchronize GitHub's file-level Viewed
-    /// state. Local subset checkpoints never grant full-file approval upstream.
+    /// Direct GitHub Viewed writes require a complete PR comparison. Selected
+    /// commit receipts must first prove coverage against that canonical snapshot.
     pub fn supports_github_viewed(&self) -> bool {
         matches!(self, Self::PullRequest { .. })
     }

@@ -225,10 +225,13 @@ impl Render for ReviewView {
                                     let mark_viewed = viewed_count < count;
                                     h_flex().debug_selector(|| "REVIEW_FOLDER_VIEWED_ACTION".into()).flex_none().min_w(rems(4.5)).pl_2().gap_2().justify_end()
                                         .child(Label::new(format!("{viewed_count}/{count}")).size(LabelSize::Small).color(Color::Muted))
-                                        .child(Checkbox::new(("review-folder-viewed", index), ui::ToggleState::from_any_and_all(viewed_count > 0, count > 0 && viewed_count == count)).fill().style(ui::ToggleStyle::Custom(cx.theme().colors().text))
+                                        .child(review_checkbox(("review-folder-viewed-target", index), Checkbox::new(("review-folder-viewed", index), ui::ToggleState::from_any_and_all(viewed_count > 0, count > 0 && viewed_count == count)).fill().style(ui::ToggleStyle::Custom(cx.theme().colors().text))
                                             .tooltip(ui::Tooltip::text(format!("Mark all {count} changed files in this folder {} (including hidden files)", if mark_viewed { "viewed" } else { "unviewed" })))
-                                            .disabled(writes_blocked || !this.data.session.selector.supports_github_viewed() || this.data.session.presentation.since_review)
-                                            .on_click(cx.listener(move |this, _, window, cx| { cx.stop_propagation(); this.mark_github_folder(&folder, mark_viewed, window, cx); })))
+                                            , writes_blocked || !this.data.session.selector.supports_github_viewed() || this.data.session.presentation.since_review,
+                                            {
+                                                let review = cx.entity().downgrade();
+                                                move |window, cx| { review.update(cx, |this, cx| this.mark_github_folder(&folder, mark_viewed, window, cx)).log_err(); }
+                                            }))
                                         .into_any_element()
                                 } else {
                                     h_flex().flex_none().min_w(rems(2.5)).pl_2().gap_2().justify_end()
@@ -448,6 +451,13 @@ impl Render for ReviewView {
                                 })),
                         )
                     })
+                    .when(matches!(self.data.session.selector, ComparisonSelector::PullRequestScope { .. }), |row| row.child(
+                        Button::new("review-mark-scope-reviewed", "Mark selected commits reviewed")
+                            .style(ButtonStyle::Outlined)
+                            .disabled(navigation_blocked || self.cached_unverified)
+                            .tooltip(ui::Tooltip::text("Mark every file comparison in the selected commits reviewed; sync only files whose full PR changes are covered"))
+                            .on_click(cx.listener(|this, _, window, cx| this.mark_selected_commits_reviewed(window, cx)))
+                    ))
                     .child(
                         Button::new("review-select-commits", "Commits")
                             .style(ButtonStyle::Outlined)

@@ -28,6 +28,7 @@ pub(crate) struct ReviewCommitPicker {
     _search_subscription: Subscription,
     search_task: Option<Task<()>>,
     preview: bool,
+    mark_reviewed: bool,
 }
 
 impl ReviewCommitPicker {
@@ -96,6 +97,7 @@ impl ReviewCommitPicker {
             _search_subscription: subscription,
             search_task: None,
             preview: false,
+            mark_reviewed: false,
         }
     }
 
@@ -130,13 +132,21 @@ impl ReviewCommitPicker {
                 let workspace = self.workspace.clone();
                 let repository = self.repository.clone();
                 let pull_request = self.pull_request.clone();
+                let mark_reviewed = self.mark_reviewed;
                 cx.emit(DismissEvent);
                 window.defer(cx, move |window, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
                             if let Some(context) = pull_request {
                                 ReviewView::deploy_pull_request_commits(
-                                    workspace, repository, context, selections, range, window, cx,
+                                    workspace,
+                                    repository,
+                                    context,
+                                    selections,
+                                    range,
+                                    mark_reviewed,
+                                    window,
+                                    cx,
                                 );
                             } else {
                                 ReviewView::deploy_commits(
@@ -574,6 +584,16 @@ impl Render for ReviewCommitPicker {
                                     .style(ButtonStyle::Outlined)
                                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                             )
+                            .when(self.pull_request.is_some(), |row| row.child(
+                                Button::new("review-mark-selected-commits", format!("Mark {} commits reviewed", self.selected.len()))
+                                    .style(ButtonStyle::Outlined)
+                                    .disabled(self.selected.is_empty() || self.preview)
+                                    .tooltip(ui::Tooltip::text("Record all changes in these commits as reviewed; only complete file coverage becomes Viewed on GitHub"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.mark_reviewed = true;
+                                        this.confirm(false, window, cx);
+                                    }))
+                            ))
                             .child(
                                 Button::new("review-selected-commits", "Apply")
                                     .style(ButtonStyle::Tinted(TintColor::Accent))
