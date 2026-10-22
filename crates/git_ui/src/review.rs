@@ -566,11 +566,20 @@ pub struct ReviewPresentation {
     #[serde(default)]
     pub multi_file: Option<bool>,
     #[serde(default)]
+    pub open_reviewed_revision: bool,
+    #[serde(default)]
     pub path_filter: String,
     pub unreviewed_only: bool,
     pub split_view: Option<bool>,
     pub selected_group: Option<String>,
     pub selected_path: Option<String>,
+}
+
+impl ReviewPresentation {
+    /// Explicit layout choices take precedence over the size-based default.
+    pub fn prefer_scrolling(&self, file_count: usize) -> bool {
+        self.multi_file.unwrap_or(file_count <= 50)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -659,3 +668,40 @@ pub use outbox::*;
 #[cfg(test)]
 #[path = "review_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::ReviewPresentation;
+
+    #[test]
+    fn scrolling_defaults_to_small_reviews_and_respects_explicit_choices() {
+        let mut presentation = ReviewPresentation::default();
+        assert!(presentation.prefer_scrolling(0));
+        assert!(presentation.prefer_scrolling(50));
+        assert!(!presentation.prefer_scrolling(51));
+        presentation.multi_file = Some(true);
+        assert!(presentation.prefer_scrolling(51));
+        presentation.multi_file = Some(false);
+        assert!(!presentation.prefer_scrolling(50));
+    }
+
+    #[test]
+    fn opening_preference_is_backward_compatible_and_persists() {
+        let presentation = ReviewPresentation::default();
+        let mut legacy = serde_json::to_value(&presentation).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("open_reviewed_revision");
+        let restored: ReviewPresentation = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.open_reviewed_revision);
+        let revision = ReviewPresentation {
+            open_reviewed_revision: true,
+            multi_file: Some(false),
+            ..presentation
+        };
+        let restored: ReviewPresentation =
+            serde_json::from_str(&serde_json::to_string(&revision).unwrap()).unwrap();
+        assert_eq!(restored, revision);
+    }
+}

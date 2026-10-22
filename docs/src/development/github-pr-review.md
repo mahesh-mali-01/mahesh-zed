@@ -69,3 +69,18 @@ acceptance payloads and screenshots must remain outside tracked source.
 The pull request workflow currently requires `gh`, supports `github.com` local
 repositories and retains history without automatic expiration. Enterprise,
 remote-project support and a retention UI are separate integration decisions.
+
+## Immutable File Preparation
+
+Review file preparation follows the native buffer store's reuse and shared
+in-flight task pattern, but keeps historical buffers separate from editable
+checkout buffers. Keys include the review session, displayed path and exact
+comparison fingerprint. Prepared contents share immutable references; native
+buffer and diff entities remain alive while an editor uses them.
+
+Preparation has its own task ownership and serialized admission, separate from
+review writes. Navigation releases obsolete queued work. Background warming
+prioritizes nearby files, skips large previews, and stops before filling the
+bounded cache. Both byte and entry limits apply, including metadata charges for
+empty files. Snapshot generation is checked after asynchronous probes before
+warming can start more work.

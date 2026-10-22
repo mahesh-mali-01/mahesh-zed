@@ -795,6 +795,28 @@ pub trait Addon: 'static {
         None
     }
 
+    /// Renders controls after the diff stat and before the Open File button.
+    fn render_buffer_header_trailing_controls(
+        &self,
+        _: &ExcerptBoundaryInfo,
+        _: &language::BufferSnapshot,
+        _: &Window,
+        _: &App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
+    /// Opens the buffer represented by a header, returning whether the action was handled.
+    /// Returning false preserves the editor's default excerpt-opening behavior.
+    fn open_buffer_header(
+        &self,
+        _: &language::BufferSnapshot,
+        _: &mut Window,
+        _: &mut App,
+    ) -> bool {
+        false
+    }
+
     fn extend_buffer_header_context_menu(
         &self,
         menu: ui::ContextMenu,

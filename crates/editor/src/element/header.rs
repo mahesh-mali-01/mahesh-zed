@@ -884,7 +884,18 @@ pub(crate) fn render_buffer_header(
                                             })
                                             .on_click(window.listener_for(editor, {
                                                 let jump_data = jump_data.clone();
+                                                let buffer_snapshot = buffer.clone();
                                                 move |editor, e: &ClickEvent, window, cx| {
+                                                    if editor.addons.values().any(|addon| {
+                                                        addon.open_buffer_header(
+                                                            &buffer_snapshot,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    }) {
+                                                        cx.stop_propagation();
+                                                        return;
+                                                    }
                                                     editor.open_excerpts_common(
                                                         Some(jump_data.clone()),
                                                         e.modifiers().secondary(),
@@ -942,6 +953,14 @@ pub(crate) fn render_buffer_header(
                                         removed as usize,
                                     )))
                                 })
+                                .children(editor_read.addons.values().filter_map(|addon| {
+                                    addon.render_buffer_header_trailing_controls(
+                                        for_excerpt,
+                                        buffer,
+                                        window,
+                                        cx,
+                                    )
+                                }))
                                 .when(show_open_file_button, |this| {
                                     this.child(
                                         Button::new("open-file-button", "Open File")
@@ -958,7 +977,18 @@ pub(crate) fn render_buffer_header(
                                             })
                                             .on_click(window.listener_for(editor, {
                                                 let jump_data = jump_data.clone();
+                                                let buffer_snapshot = buffer.clone();
                                                 move |editor, e: &ClickEvent, window, cx| {
+                                                    if editor.addons.values().any(|addon| {
+                                                        addon.open_buffer_header(
+                                                            &buffer_snapshot,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    }) {
+                                                        cx.stop_propagation();
+                                                        return;
+                                                    }
                                                     editor.open_excerpts_common(
                                                         Some(jump_data.clone()),
                                                         e.modifiers().secondary(),

@@ -108,6 +108,7 @@ mod github_viewed;
 
 #[path = "review_view_coverage.rs"]
 mod coverage;
+mod preparation;
 mod presentation;
 
 const GROUP: &str = "comparison";
@@ -934,12 +935,13 @@ struct PreparedReviewFile {
     fingerprint: String,
     buffer: Entity<language::Buffer>,
     diff: Entity<BufferDiff>,
-    retained: RetainedContents,
+    retained: Arc<RetainedContents>,
     cost: usize,
+    binary: bool,
 }
 
 fn review_file_window(file_count: usize, selected: usize) -> std::ops::Range<usize> {
-    if file_count < 50 {
+    if file_count <= 50 {
         return 0..file_count;
     }
     let selected = selected.min(file_count.saturating_sub(1));
@@ -1011,6 +1013,14 @@ pub struct ReviewView {
     cached_unverified: bool,
     prepared_files: VecDeque<PreparedReviewFile>,
     prepared_bytes: usize,
+    loading_files: BTreeMap<
+        String,
+        futures::future::Shared<Task<Result<PreparedReviewFile, Arc<anyhow::Error>>>>,
+    >,
+    prewarm_task: Option<Task<()>>,
+    preparation_lock: Arc<futures::lock::Mutex<()>>,
+    copied_path: Option<String>,
+    copied_path_task: Option<Task<()>>,
     selected_patch_contents: Vec<(String, FileComparison, RetainedContents)>,
     github_buffers: Vec<CanonicalCommentBuffer>,
     github_capture: Option<CapturedCommentAnchor>,
@@ -1096,6 +1106,79 @@ struct ReviewFileHeaderAddon {
 impl editor::Addon for ReviewFileHeaderAddon {
     fn to_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn render_buffer_header_trailing_controls(
+        &self,
+        _: &multi_buffer::ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _: &Window,
+        cx: &App,
+    ) -> Option<gpui::AnyElement> {
+        let path = buffer.file()?.path().to_string();
+        let copied = self.review.upgrade()?.read(cx).copied_path.as_ref() == Some(&path);
+        let review = self.review.clone();
+        Some(
+            IconButton::new(
+                SharedString::from(format!("review-copy-path-{path}")),
+                if copied {
+                    IconName::Check
+                } else {
+                    IconName::Copy
+                },
+            )
+            .tooltip(ui::Tooltip::text(if copied {
+                "Copied relative path"
+            } else {
+                "Copy relative path"
+            }))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
+                review
+                    .update(cx, |view, cx| {
+                        view.copied_path = Some(path.clone());
+                        view.copied_path_task = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_secs(2))
+                                .await;
+                            this.update(cx, |view, cx| {
+                                view.copied_path = None;
+                                cx.notify();
+                            })
+                            .log_err();
+                        }));
+                        cx.notify();
+                    })
+                    .log_err();
+            })
+            .into_any_element(),
+        )
+    }
+
+    fn open_buffer_header(
+        &self,
+        buffer: &language::BufferSnapshot,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(path) = buffer.file().map(|file| file.path().to_string()) else {
+            return false;
+        };
+        let Some(review) = self.review.upgrade() else {
+            return false;
+        };
+        if review
+            .read(cx)
+            .data
+            .session
+            .presentation
+            .open_reviewed_revision
+        {
+            return false;
+        }
+        review.update(cx, |view, cx| view.open_current_file(&path, window, cx));
+        true
     }
 
     fn render_buffer_header_controls(
@@ -2763,6 +2846,11 @@ impl ReviewView {
             cached_unverified: false,
             prepared_files: VecDeque::new(),
             prepared_bytes: 0,
+            loading_files: BTreeMap::new(),
+            prewarm_task: None,
+            preparation_lock: Arc::new(futures::lock::Mutex::new(())),
+            copied_path: None,
+            copied_path_task: None,
             selected_patch_contents: Vec::new(),
             github_buffers: Vec::new(),
             github_capture: None,
@@ -3268,7 +3356,7 @@ impl ReviewView {
                 let mut prepared = Vec::new();
                 for (group, commit, file, fingerprint, cached) in patches {
                     if let Some(cached) = cached {
-                        prepared.push((group, file, cached.retained, cached.buffer, cached.diff));
+                        prepared.push((group, file, cached.retained.as_ref().clone(), cached.buffer, cached.diff));
                         continue;
                     }
                     let mut contents = Vec::new();
@@ -3298,12 +3386,12 @@ impl ReviewView {
                     })??;
                     let buffer = build_buffer(new, blob, &registry, cx).await?;
                     let diff = build_buffer_diff(old, &buffer, &registry, cx).await?;
-                    let cost = retained.old.as_ref().map_or(0, Vec::len).saturating_add(retained.new.as_ref().map_or(0, Vec::len)).saturating_mul(4);
-                    let cached = PreparedReviewFile { fingerprint, buffer: buffer.clone(), diff: diff.clone(), retained: retained.clone(), cost };
+                    let cost = retained.old.as_ref().map_or(0, Vec::len).saturating_add(retained.new.as_ref().map_or(0, Vec::len)).saturating_mul(4).max(16 * 1024);
+                    let cached = PreparedReviewFile { fingerprint, buffer: buffer.clone(), diff: diff.clone(), retained: Arc::new(retained.clone()), cost, binary };
                     this.update(cx, |this, _| {
                         const BUDGET: usize = 64 * 1024 * 1024;
                         if cost <= BUDGET {
-                            while this.prepared_bytes.saturating_add(cost) > BUDGET {
+                            while this.prepared_bytes.saturating_add(cost) > BUDGET || this.prepared_files.len() >= 128 {
                                 let Some(evicted) = this.prepared_files.pop_front() else { break; };
                                 this.prepared_bytes = this.prepared_bytes.saturating_sub(evicted.cost);
                             }
@@ -3352,6 +3440,24 @@ impl ReviewView {
     }
 
     fn load_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prewarm_task = None;
+        let desired_key = self
+            .data
+            .session
+            .presentation
+            .selected_path
+            .as_deref()
+            .and_then(|path| {
+                self.data
+                    .session
+                    .snapshot
+                    .file(active_group(&self.data), path)
+                    .ok()
+                    .and_then(|file| file.fingerprint().ok())
+                    .map(|fingerprint| format!("{}:{}:{}", self.data.session.id, path, fingerprint))
+            });
+        self.loading_files
+            .retain(|key, _| Some(key) == desired_key.as_ref());
         let scroll_driven = std::mem::take(&mut self.rolling_scroll);
         self.rolling_file_task = None;
         self.rolling_file_load = false;
@@ -3427,156 +3533,20 @@ impl ReviewView {
         }
         let group = active_group(&self.data).to_owned();
         let session = self.data.session.clone();
-        let db = self.db.clone();
         let repository = self.repository.clone();
         let project = self.project.clone();
         let workspace = self.workspace.clone();
+        let preparation = self.prepare_file(comparison.clone(), group.clone(), window, cx);
         let prepared_cache = self.prepared_files.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             let result: Result<()> = async {
                 let mut cache_hits = usize::from(cached_prepared.is_some());
                 let mut cache_misses = usize::from(cached_prepared.is_none());
-                let cached = if let Some(cached) = &cached_prepared {
-                    Some(cached.retained.clone())
-                } else { cx
-                    .background_spawn({
-                        let db = db.clone();
-                        let id = session.id.clone();
-                        let path = path.clone();
-                        let comparison = comparison.clone();
-                        let group = group.clone();
-                        async move {
-                            db.matching_checkpoint_contents(&id, &group, &path, &comparison, REVIEW_PREVIEW_BUDGET as usize)
-                        }
-                    })
-                    .await? };
-                let retained = if let Some(retained) = cached {
-                    retained
-                } else {
-                    // Only cache misses need the original Git objects. Probe
-                    // their lengths before materializing either side.
-                    let objects = comparison.old.iter().chain(&comparison.new)
-                        .filter(|side| side.mode != 0o160000)
-                        .map(|side| side.object.hex.parse())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let expected_sizes = objects.len();
-                    let sizes = repository.read_with(cx, |repository, cx| {
-                        repository.review_blob_sizes(objects, cx)
-                    }).await?;
-                    ensure!(sizes.len() == expected_sizes, "Historical file size response is incomplete");
-                    let preview_bytes = sizes.into_iter().try_fold(0u64, |total, size| {
-                        total.checked_add(size).context("Historical file size overflow")
-                    })?;
-                    ensure!(preview_bytes <= REVIEW_PREVIEW_BUDGET,
-                        "Preview unavailable: this file's old and new contents exceed the {} MiB preview limit. No contents were loaded or marked reviewed. Choose another file to continue reviewing.",
-                        REVIEW_PREVIEW_BUDGET / (1024 * 1024));
-                    let mut sides = Vec::new();
-                    for side in [&comparison.old, &comparison.new] {
-                        sides.push(
-                            if let Some(side) = side.as_ref().filter(|side| side.mode != 0o160000) {
-                                let object = side.object.hex.parse()?;
-                                Some(
-                                    repository
-                                        .read_with(cx, |repo, cx| repo.review_blob(object, cx))
-                                        .await?,
-                                )
-                            } else {
-                                None
-                            },
-                        );
-                    }
-                    let mut sides = sides.into_iter();
-                    RetainedContents {
-                        old: sides.next().flatten(),
-                        new: sides.next().flatten(),
-                    }
-                };
-                let (retained, old_text, new_text, binary) = cx
-                    .background_spawn({
-                        let comparison = comparison.clone();
-                        async move {
-                            comparison.validate_retained(&retained, REVIEW_PREVIEW_BUDGET as usize)?;
-                            let gitlink = comparison
-                                .old
-                                .iter()
-                                .chain(&comparison.new)
-                                .any(|side| side.mode == 0o160000);
-                            let binary = gitlink
-                                || [&retained.old, &retained.new].into_iter().flatten().any(
-                                    |bytes| {
-                                        bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
-                                    },
-                                );
-                            let (old_text, new_text) = if binary {
-                                let label = if gitlink {
-                                    "Submodule identity changed (see object IDs above)"
-                                } else {
-                                    "Binary content changed (preview unavailable)"
-                                }
-                                .to_owned();
-                                (Some(label.clone()), label)
-                            } else {
-                                (
-                                    retained
-                                        .old
-                                        .as_ref()
-                                        .map(|bytes| String::from_utf8(bytes.clone()))
-                                        .transpose()?,
-                                    retained
-                                        .new
-                                        .as_ref()
-                                        .map(|bytes| String::from_utf8(bytes.clone()))
-                                        .transpose()?
-                                        .unwrap_or_default(),
-                                )
-                            };
-                            if !binary {
-                                if let Some(old_text) = &old_text { crate::commit_view::validate_review_text(old_text)?; }
-                                crate::commit_view::validate_review_text(&new_text)?;
-                            }
-                            Ok::<_, anyhow::Error>((retained, old_text, new_text, binary))
-                        }
-                    })
-                    .await?;
-                let (registry, file) = cx.update(|_, cx| {
-                    let repo_path = RepoPath::from_rel_path(RelPath::from_unix_str(&path)?);
-                    let worktree_id = worktree_id_for_repo_path(
-                        repository.read(cx),
-                        project.read(cx),
-                        &repo_path,
-                        cx,
-                    )
-                    .context("repository worktree unavailable")?;
-                    let file = Arc::new(GitBlob {
-                        path: repo_path,
-                        worktree_id,
-                        is_deleted: comparison.new.is_none(),
-                        is_binary: binary,
-                        display_name: path.clone(),
-                    }) as Arc<dyn File>;
-                    Ok::<_, anyhow::Error>((project.read(cx).languages().clone(), file))
-                })??;
-                let (buffer, diff) = if let Some(cached) = &cached_prepared {
-                    (cached.buffer.clone(), cached.diff.clone())
-                } else {
-                    let buffer = build_buffer(new_text, file, &registry, cx).await?;
-                    let diff = build_buffer_diff(old_text, &buffer, &registry, cx).await?;
-                    let cost = retained.old.as_ref().map_or(0, Vec::len)
-                        .saturating_add(retained.new.as_ref().map_or(0, Vec::len)).saturating_mul(4);
-                    let cache = PreparedReviewFile { fingerprint, buffer: buffer.clone(), diff: diff.clone(), retained: retained.clone(), cost };
-                    this.update(cx, |this, _| {
-                        const BUDGET: usize = 64 * 1024 * 1024;
-                        if cost <= BUDGET {
-                            while this.prepared_bytes.saturating_add(cost) > BUDGET {
-                                let Some(evicted) = this.prepared_files.pop_front() else { break; };
-                                this.prepared_bytes = this.prepared_bytes.saturating_sub(evicted.cost);
-                            }
-                            this.prepared_bytes += cost;
-                            this.prepared_files.push_back(cache);
-                        }
-                    })?;
-                    (buffer, diff)
-                };
+                let cached = preparation.await.map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                let retained = cached.retained.as_ref().clone();
+                let binary = cached.binary;
+                let buffer = cached.buffer.clone();
+                let diff = cached.diff.clone();
                 let mut prepared = vec![(buffer, diff, comparison.clone(), binary)];
                 let group_files = session
                     .snapshot
@@ -3586,7 +3556,7 @@ impl ReviewView {
                     .context("Comparison group unavailable")?
                     .files
                     .clone();
-                let want_multi = session.presentation.multi_file.unwrap_or(true)
+                let want_multi = session.presentation.prefer_scrolling(group_files.len())
                     && session.selector.supports_github_viewed();
                 let total_group_files = group_files.len();
                 let center = group_files.iter().position(|file| file.file_key().ok() == Some(path.as_str())).unwrap_or(0);
@@ -3662,101 +3632,12 @@ impl ReviewView {
                                 continue;
                             }
                             cache_misses += 1;
-                            let mut contents = Vec::new();
-                            for side in [&comparison.old, &comparison.new] {
-                                contents.push(
-                                    if let Some(side) =
-                                        side.as_ref().filter(|side| side.mode != 0o160000)
-                                    {
-                                        let object = side.object.hex.parse()?;
-                                        Some(
-                                            repository
-                                                .read_with(cx, |repository, cx| {
-                                                    repository.review_blob(object, cx)
-                                                })
-                                                .await?,
-                                        )
-                                    } else {
-                                        None
-                                    },
-                                );
+                            let preparation = this.update_in(cx, |view, window, cx| view.prepare_file(comparison.clone(), group.clone(), window, cx))?;
+                            match preparation.await {
+                                Ok(cached) => prepared.push((cached.buffer.clone(), cached.diff.clone(), comparison.clone(), cached.binary)),
+                                Err(error) => { layout_note = Some(format!("A neighboring file loads on selection: {error:#}")); }
                             }
-                            let mut contents = contents.into_iter();
-                            let old = contents.next().flatten();
-                            let new = contents.next().flatten();
-                            let binary = comparison
-                                .old
-                                .iter()
-                                .chain(&comparison.new)
-                                .any(|side| side.mode == 0o160000)
-                                || old.iter().chain(&new).any(|bytes| {
-                                    bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
-                                });
-                            let retained = RetainedContents { old: old.clone(), new: new.clone() };
-                            let (old_text, new_text) = if binary {
-                                (
-                                    Some(
-                                        "Binary or submodule content (preview unavailable)"
-                                            .to_string(),
-                                    ),
-                                    "Binary or submodule content (preview unavailable)".to_string(),
-                                )
-                            } else {
-                                (
-                                    old.map(String::from_utf8).transpose()?,
-                                    new.map(String::from_utf8).transpose()?.unwrap_or_default(),
-                                )
-                            };
-                            if !binary {
-                                let validation = cx.background_spawn({
-                                    let old_text = old_text.clone();
-                                    let new_text = new_text.clone();
-                                    async move {
-                                        if let Some(text) = old_text { crate::commit_view::validate_review_text(&text)?; }
-                                        crate::commit_view::validate_review_text(&new_text)
-                                    }
-                                }).await;
-                                if let Err(error) = validation {
-                                    layout_note = Some(format!("A neighboring file loads on selection: bounded preview required ({error})"));
-                                    continue;
-                                }
-                            }
-                            let file = cx.update(|_, cx| {
-                                let repo_path =
-                                    RepoPath::from_rel_path(RelPath::from_unix_str(&other_path)?);
-                                let worktree_id = worktree_id_for_repo_path(
-                                    repository.read(cx),
-                                    project.read(cx),
-                                    &repo_path,
-                                    cx,
-                                )
-                                .context("Repository worktree unavailable")?;
-                                Ok::<_, anyhow::Error>(Arc::new(GitBlob {
-                                    path: repo_path,
-                                    worktree_id,
-                                    is_deleted: comparison.new.is_none(),
-                                    is_binary: binary,
-                                    display_name: other_path,
-                                })
-                                    as Arc<dyn File>)
-                            })??;
-                            let buffer = build_buffer(new_text, file, &registry, cx).await?;
-                            let diff = build_buffer_diff(old_text, &buffer, &registry, cx).await?;
-                            let cost = retained.old.as_ref().map_or(0, Vec::len)
-                                .saturating_add(retained.new.as_ref().map_or(0, Vec::len)).saturating_mul(4);
-                            let cached = PreparedReviewFile { fingerprint, buffer: buffer.clone(), diff: diff.clone(), retained, cost };
-                            this.update(cx, |this, _| {
-                                const BUDGET: usize = 64 * 1024 * 1024;
-                                if cost <= BUDGET {
-                                    while this.prepared_bytes.saturating_add(cost) > BUDGET {
-                                        let Some(evicted) = this.prepared_files.pop_front() else { break; };
-                                        this.prepared_bytes = this.prepared_bytes.saturating_sub(evicted.cost);
-                                    }
-                                    this.prepared_bytes += cost;
-                                    this.prepared_files.push_back(cached);
-                                }
-                            })?;
-                            prepared.push((buffer, diff, comparison.clone(), binary));
+
                         }
                     } else {
                         layout_note =
@@ -3802,7 +3683,7 @@ impl ReviewView {
                         })
                         .unwrap_or(editor::EditorSettings::get_global(cx).diff_view_style);
                     let scope = (session.snapshot.generation, group.clone(), style == DiffViewStyle::Split);
-                    let reused_editor = this.multi_loaded && this.loaded_window_scope.as_ref() == Some(&scope);
+                    let reused_editor = this.retained.is_some() && this.editor.is_some() && this.loaded_window_scope.as_ref() == Some(&scope);
                     let editor = if reused_editor {
                         this.editor.clone().context("Scrolling editor disappeared")?
                     } else {
@@ -3974,7 +3855,7 @@ impl ReviewView {
                     this.retained = Some(retained);
                     this.multi_loaded = multi_loaded;
                     this.loaded_window_scope = Some(scope);
-                    if total_group_files >= 50 && want_multi && layout_note.is_none() {
+                    if total_group_files > 50 && want_multi && layout_note.is_none() {
                         layout_note = Some("Scrolling nearby files · large files load on selection".into());
                     }
                     this.apply_review_file_folds(cx);
@@ -3984,6 +3865,7 @@ impl ReviewView {
                     }
                     #[cfg(not(test))]
                     this.drain_github_viewed_sync(window, cx);
+                    this.start_prewarming(window, cx);
                     log::info!("review preparation cache: {cache_hits} hits, {cache_misses} misses");
                     log::info!(
                         "pull request review review file ready: {} files rendered in {} ms (excludes paint)",
@@ -4029,7 +3911,8 @@ impl ReviewView {
     }
 
     fn extend_scrolling_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.rolling_file_load || !self.multi_loaded || self.data.files.len() < 50 {
+        if self.busy || self.rolling_file_load || !self.multi_loaded || self.data.files.len() <= 50
+        {
             return;
         }
         let Some(editor) = self.editor.as_ref() else {
@@ -4781,10 +4664,7 @@ impl ReviewView {
         });
     }
 
-    fn open_in_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = &self.data.session.presentation.selected_path else {
-            return;
-        };
+    fn open_current_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let result = (|| -> Result<()> {
             let path = RepoPath::from_rel_path(RelPath::from_unix_str(path)?);
             let path = self
@@ -4794,7 +4674,7 @@ impl ReviewView {
                 .context("file not available in the project")?;
             ensure!(
                 self.project.read(cx).entry_for_path(&path, cx).is_some(),
-                "file is absent from the current checkout"
+                "File is absent from the current checkout. Choose Open File: Reviewed revision in the view menu to inspect its read-only version."
             );
             let workspace = self.workspace.clone();
             let origin = cx.weak_entity();
@@ -4819,7 +4699,7 @@ impl ReviewView {
                 if let Err(error) = result {
                     origin
                         .update(cx, |view, cx| {
-                            view.error = Some(error.to_string());
+                            view.check_error = Some(error.to_string());
                             cx.notify();
                         })
                         .log_err();
@@ -4828,7 +4708,7 @@ impl ReviewView {
             Ok(())
         })();
         if let Err(error) = result {
-            self.error = Some(error.to_string());
+            self.check_error = Some(error.to_string());
             cx.notify();
         }
     }

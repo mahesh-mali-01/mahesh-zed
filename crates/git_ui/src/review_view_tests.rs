@@ -34,6 +34,13 @@ fn comparison(path: &str, old: &[u8], new: &[u8]) -> FileComparison {
 }
 
 async fn fixture(cx: &mut TestAppContext) -> Result<Fixture> {
+    fixture_with_setup(cx, |_, _| {}).await
+}
+
+async fn fixture_with_setup(
+    cx: &mut TestAppContext,
+    before_project: impl FnOnce(&Arc<FakeFs>, &PathBuf),
+) -> Result<Fixture> {
     cx.executor().allow_parking();
     cx.update(|cx| {
         let settings = SettingsStore::test(cx);
@@ -104,6 +111,7 @@ async fn fixture(cx: &mut TestAppContext) -> Result<Fixture> {
             }
         })
         .context("fake Git state")?;
+    before_project(&fake_fs, &root);
     let project = Project::test(fake_fs.clone(), [&root as &std::path::Path], cx).await;
     project
         .update(cx, |project, cx| project.git_scans_complete(cx))
@@ -2207,7 +2215,7 @@ async fn review_open_project_navigation_releases_review_listener_lease(cx: &mut 
     let workspace = view.read_with(&cx, |view, _| view.workspace.upgrade().expect("workspace"));
     view.update_in(&mut cx, |view, window, cx| {
         view.data.session.presentation.selected_path = Some("auth.ts".into());
-        view.open_in_project(window, cx);
+        view.open_current_file("auth.ts", window, cx);
     });
     cx.run_until_parked();
     workspace.read_with(&cx, |workspace, cx| {
@@ -2531,6 +2539,11 @@ async fn review_file_switch_keeps_visible_editor_and_reuses_immutable_preparatio
     cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
         .await;
     view.read_with(&cx, |view, cx| {
+        assert_eq!(
+            view.editor.as_ref().unwrap().entity_id(),
+            original.0,
+            "single-file navigation preserves the native editor container"
+        );
         let buffer = view
             .editor
             .as_ref()
@@ -3441,9 +3454,11 @@ async fn inline_comment_commands_do_not_open_the_optional_threads_panel(cx: &mut
 fn review_file_windows_cover_small_prs_and_bound_large_prs() {
     assert_eq!(review_file_window(0, 0), 0..0);
     assert_eq!(review_file_window(49, 24), 0..49);
-    assert_eq!(review_file_window(50, 0), 0..6);
-    assert_eq!(review_file_window(50, 25), 20..31);
-    assert_eq!(review_file_window(50, 49), 44..50);
+    assert_eq!(review_file_window(50, 0), 0..50);
+    assert_eq!(review_file_window(50, 25), 0..50);
+    assert_eq!(review_file_window(51, 0), 0..6);
+    assert_eq!(review_file_window(51, 25), 20..31);
+    assert_eq!(review_file_window(51, 50), 45..51);
     assert_eq!(review_file_window(2_000, 1_000), 995..1006);
     // Walking adjacent centers never drops the reading file and never skips
     // a boundary when moving forward or backward through a large comparison.
@@ -3520,7 +3535,7 @@ async fn assert_large_pr_window_collapse_after_selection_eviction(
     let (view, mut cx) = review_window(&fixture, cx, None);
     cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
         .await;
-    let files = (0..50)
+    let files = (0..51)
         .map(|index| {
             comparison(
                 &format!("file-{index:03}.ts"),
@@ -3560,7 +3575,7 @@ async fn assert_large_pr_window_collapse_after_selection_eviction(
         view.data.session.snapshot.groups[0].files = files;
         view.data.session.presentation.selected_path = Some("file-025.ts".into());
         view.data.session.presentation.split_view = Some(split);
-        view.data.session.presentation.multi_file = None;
+        view.data.session.presentation.multi_file = Some(true);
         view.load_selected(window, cx);
     });
     cx.condition(&view, |view, _| !view.busy).await;
@@ -4888,4 +4903,397 @@ async fn rendered_tree_navigation_matches_full_navigation_for_hidden_and_filtere
             }
         }
     }
+}
+
+#[gpui::test]
+async fn immutable_preparation_coalesces_reuses_and_retries_without_poisoning(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let file = fixture.session.snapshot.groups[0].files[1].clone();
+    let (first, second) = view.update_in(&mut cx, |view, window, cx| {
+        let first = view.prepare_file(file.clone(), GROUP.into(), window, cx);
+        let second = view.prepare_file(file.clone(), GROUP.into(), window, cx);
+        assert_eq!(
+            view.loading_files.len(),
+            1,
+            "one in-flight task for identical immutable contents"
+        );
+        (first, second)
+    });
+    let first = first.await.unwrap();
+    let second = second.await.unwrap();
+    assert_eq!(first.buffer.entity_id(), second.buffer.entity_id());
+    assert_eq!(first.diff.entity_id(), second.diff.entity_id());
+    assert!(
+        Arc::ptr_eq(&first.retained, &second.retained),
+        "shared requests cannot copy immutable contents"
+    );
+    view.read_with(&cx, |view, _| assert!(view.loading_files.is_empty()));
+    fixture
+        .fs
+        .with_git_state(&fixture.root.join(".git"), false, |state| {
+            state.oids.clear()
+        })
+        .unwrap();
+    let cached = view
+        .update_in(&mut cx, |view, window, cx| {
+            view.prepare_file(file.clone(), GROUP.into(), window, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        first.buffer.entity_id(),
+        cached.buffer.entity_id(),
+        "warm hit must not read missing Git objects"
+    );
+    assert!(Arc::ptr_eq(&first.retained, &cached.retained));
+    let changed = comparison("billing.ts", b"10\n", b"new revision\n");
+    let failed = view
+        .update_in(&mut cx, |view, window, cx| {
+            view.prepare_file(changed.clone(), GROUP.into(), window, cx)
+        })
+        .await;
+    assert!(
+        failed.is_err(),
+        "changed object identity cannot reuse stale bytes"
+    );
+    view.read_with(&cx, |view, _| {
+        assert!(
+            view.loading_files.is_empty(),
+            "failure cannot poison a retry"
+        )
+    });
+    fixture
+        .fs
+        .with_git_state(&fixture.root.join(".git"), false, |state| {
+            state.oids.insert(
+                changed.old.as_ref().unwrap().object.hex.parse().unwrap(),
+                b"10\n".to_vec(),
+            );
+            state.oids.insert(
+                changed.new.as_ref().unwrap().object.hex.parse().unwrap(),
+                b"new revision\n".to_vec(),
+            );
+        })
+        .unwrap();
+    let retried = view
+        .update_in(&mut cx, |view, window, cx| {
+            view.prepare_file(changed.clone(), GROUP.into(), window, cx)
+        })
+        .await
+        .unwrap();
+    assert_ne!(retried.buffer.entity_id(), first.buffer.entity_id());
+    assert_eq!(
+        retried.retained.new.as_deref(),
+        Some(b"new revision\n".as_slice())
+    );
+}
+
+#[gpui::test]
+async fn background_preparation_keeps_visible_editor_and_write_owner(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().entity_id());
+    view.update_in(&mut cx, |view, window, cx| {
+        view.data.session.selector = ComparisonSelector::PullRequest {
+            identity: PullRequestIdentity {
+                host: "github.com".into(),
+                repository_node_id: "R_fixture".into(),
+                pull_request_node_id: "PR_fixture".into(),
+                viewer_node_id: "U_fixture".into(),
+            },
+        };
+        view.github_viewed_busy = true;
+        view.start_prewarming(window, cx);
+    });
+    let warming = view.update(&mut cx, |view, _| {
+        view.prewarm_task.take().expect("warming queued")
+    });
+    warming.await;
+    view.read_with(&cx, |view, _| {
+        assert_eq!(
+            view.prepared_files.len(),
+            2,
+            "background billing preparation"
+        )
+    });
+    view.read_with(&cx, |view, _| {
+        assert_eq!(view.editor.as_ref().unwrap().entity_id(), editor);
+        assert!(
+            view.github_viewed_busy,
+            "prewarming never finishes a write owner"
+        );
+        assert!(!view.busy);
+        assert!(view.prepared_bytes <= 64 * 1024 * 1024);
+    });
+    fixture
+        .fs
+        .with_git_state(&fixture.root.join(".git"), false, |state| {
+            state.oids.clear()
+        })
+        .unwrap();
+    view.update_in(&mut cx, |view, window, cx| {
+        view.data.session.presentation.multi_file = Some(false);
+        let mut presentation = view.data.session.presentation.clone();
+        presentation.selected_path = Some("billing.ts".into());
+        view.change_presentation(presentation, window, cx);
+    });
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    view.read_with(&cx, |view, _| {
+        assert!(view.error.is_none(), "{:?}", view.error)
+    });
+}
+
+#[gpui::test]
+async fn header_open_routes_its_own_path_and_opening_preference_preserves_editor(
+    cx: &mut TestAppContext,
+) {
+    use editor::Addon as _;
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let workspace = view.read_with(&cx, |view, _| view.workspace.upgrade().unwrap());
+    let file = fixture.session.snapshot.groups[0].files[1].clone();
+    let prepared = view
+        .update_in(&mut cx, |view, window, cx| {
+            view.prepare_file(file, GROUP.into(), window, cx)
+        })
+        .await
+        .unwrap();
+    let snapshot = prepared
+        .buffer
+        .read_with(&cx, |buffer, _| buffer.snapshot());
+    let original_editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().entity_id());
+    view.update_in(&mut cx, |view, window, cx| {
+        let mut presentation = view.data.session.presentation.clone();
+        presentation.open_reviewed_revision = true;
+        view.change_presentation(presentation, window, cx);
+        assert_eq!(view.editor.as_ref().unwrap().entity_id(), original_editor);
+        assert!(!view.busy, "opening preference cannot rebuild the diff");
+    });
+    cx.condition(&view, |view, _| !view.navigation_pending)
+        .await;
+    let stored = fixture.db.load_session(&fixture.session.id).unwrap();
+    assert!(stored.presentation.open_reviewed_revision);
+    cx.update(|window, cx| {
+        let addon = ReviewFileHeaderAddon {
+            review: view.downgrade(),
+        };
+        assert!(
+            !addon.open_buffer_header(&snapshot, window, cx),
+            "reviewed mode delegates to native immutable opening"
+        );
+    });
+    view.update_in(&mut cx, |view, window, cx| {
+        let mut presentation = view.data.session.presentation.clone();
+        presentation.open_reviewed_revision = false;
+        view.change_presentation(presentation, window, cx);
+        assert_eq!(
+            view.data.session.presentation.selected_path.as_deref(),
+            Some("auth.ts")
+        );
+    });
+    cx.update(|window, cx| {
+        let addon = ReviewFileHeaderAddon {
+            review: view.downgrade(),
+        };
+        assert!(addon.open_buffer_header(&snapshot, window, cx));
+    });
+    cx.run_until_parked();
+    workspace.read_with(&cx, |workspace, cx| {
+        let editor = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("checkout editor");
+        assert_eq!(
+            editor.read(cx).text(cx),
+            "WORKTREE billing\n",
+            "header path wins over unrelated selected tree row"
+        );
+        assert!(!editor.read(cx).read_only(cx));
+    });
+}
+
+#[gpui::test]
+async fn rapid_navigation_cancels_obsolete_queued_preparation(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let admission = view.read_with(&cx, |view, _| view.preparation_lock.clone());
+    let permit = admission.lock().await;
+    view.update_in(&mut cx, |view, window, cx| {
+        view.prepared_files.clear();
+        view.prepared_bytes = 0;
+        for index in 0..20 {
+            view.data.session.presentation.selected_path = Some(
+                if index % 2 == 0 {
+                    "auth.ts"
+                } else {
+                    "billing.ts"
+                }
+                .into(),
+            );
+            view.load_selected(window, cx);
+            assert!(
+                view.loading_files.len() <= 1,
+                "obsolete queued work must lose its owner"
+            );
+        }
+    });
+    cx.run_until_parked();
+    drop(permit);
+    cx.condition(&view, |view, _| !view.busy && view.loading_files.is_empty())
+        .await;
+    view.read_with(&cx, |view, _| {
+        assert!(view.error.is_none(), "{:?}", view.error);
+        assert_eq!(
+            view.data.session.presentation.selected_path.as_deref(),
+            Some("billing.ts")
+        );
+        assert_eq!(
+            view.prepared_files.len(),
+            1,
+            "only final selected contents were prepared"
+        );
+    });
+}
+
+#[gpui::test]
+async fn empty_review_files_obey_cache_entry_and_metadata_limits(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let empty = ObjectId::for_blob(ObjectFormat::Sha1, b"");
+    fixture
+        .fs
+        .with_git_state(&fixture.root.join(".git"), false, |state| {
+            state.oids.insert(empty.hex.parse().unwrap(), Vec::new());
+        })
+        .unwrap();
+    for index in 0..140 {
+        let mut file = comparison(&format!("empty-{index}.txt"), b"", b"");
+        file.old = None;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.prepare_file(file, GROUP.into(), window, cx)
+        })
+        .await
+        .unwrap();
+    }
+    view.read_with(&cx, |view, _| {
+        assert_eq!(view.prepared_files.len(), 128);
+        assert!(
+            view.prepared_bytes >= 128 * 16 * 1024,
+            "native entity overhead is charged even for empty content"
+        );
+        assert!(view.prepared_bytes <= 64 * 1024 * 1024);
+    });
+    let warming = view.update_in(&mut cx, |view, window, cx| {
+        view.data.session.selector = ComparisonSelector::PullRequest {
+            identity: PullRequestIdentity {
+                host: "github.com".into(),
+                repository_node_id: "R_fixture".into(),
+                pull_request_node_id: "PR_fixture".into(),
+                viewer_node_id: "U_fixture".into(),
+            },
+        };
+        view.start_prewarming(window, cx);
+        view.prewarm_task.take().unwrap()
+    });
+    warming.await;
+    view.read_with(&cx, |view, _| {
+        assert_eq!(view.prepared_files.len(), 128);
+        assert!(
+            view.prepared_files
+                .iter()
+                .any(|file| file.fingerprint.contains(":billing.ts:")),
+            "nearby warming must replace cold entries even when the cache is full"
+        );
+    });
+}
+
+#[gpui::test]
+async fn current_checkout_open_preserves_unsaved_buffer_and_missing_path_keeps_review(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let workspace = view.read_with(&cx, |view, _| view.workspace.upgrade().unwrap());
+    let review_editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().entity_id());
+    view.update_in(&mut cx, |view, window, cx| {
+        view.open_current_file("missing.txt", window, cx);
+        assert!(view.error.is_none());
+        assert!(
+            view.check_error
+                .as_deref()
+                .unwrap()
+                .contains("Reviewed revision")
+        );
+        assert_eq!(view.editor.as_ref().unwrap().entity_id(), review_editor);
+        view.open_current_file("billing.ts", window, cx);
+    });
+    cx.run_until_parked();
+    let editor = workspace.read_with(&cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+    editor.update_in(&mut cx, |editor, window, cx| {
+        editor.insert("unsaved draft ", window, cx)
+    });
+    let text = editor.read_with(&cx, |editor, cx| editor.text(cx));
+    workspace.update_in(&mut cx, |workspace, window, cx| {
+        workspace.activate_item(&view, true, true, window, cx)
+    });
+    view.update_in(&mut cx, |view, window, cx| {
+        view.open_current_file("billing.ts", window, cx)
+    });
+    cx.run_until_parked();
+    let reopened = workspace.read_with(&cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+    assert_eq!(editor.entity_id(), reopened.entity_id());
+    assert_eq!(reopened.read_with(&cx, |editor, cx| editor.text(cx)), text);
+    assert!(text.contains("unsaved draft"));
+}
+
+#[gpui::test]
+async fn switching_files_during_started_git_read_releases_admission_and_rejects_old_result(
+    cx: &mut TestAppContext,
+) {
+    let mut gate = None;
+    let fixture = fixture_with_setup(cx, |fs, root| {
+        gate = Some(fs.install_blob_read_gate_for_repo(&root.join(".git")));
+    })
+    .await
+    .unwrap();
+    let gate = gate.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.run_until_parked();
+    assert_eq!(gate.waiting(), 1, "immutable Git read has started");
+    view.update_in(&mut cx, |view, window, cx| {
+        view.data.session.presentation.selected_path = Some("billing.ts".into());
+        view.load_selected(window, cx);
+    });
+    gate.open();
+    cx.condition(&view, |view, _| !view.busy && view.loading_files.is_empty())
+        .await;
+    view.read_with(&cx, |view, cx| {
+        assert!(view.error.is_none(), "{:?}", view.error);
+        assert_eq!(
+            view.data.session.presentation.selected_path.as_deref(),
+            Some("billing.ts")
+        );
+        let editor = view.editor.as_ref().unwrap().read(cx).rhs_editor();
+        assert!(editor.read(cx).text(cx).contains("12"));
+        assert!(!editor.read(cx).text(cx).contains("reviewed auth"));
+    });
 }

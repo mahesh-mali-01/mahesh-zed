@@ -51,12 +51,14 @@ impl Render for ReviewView {
         let split_mode = self.data.session.presentation.split_view.unwrap_or(
             editor::EditorSettings::get_global(cx).diff_view_style == DiffViewStyle::Split,
         );
-        let multi_mode = self.multi_loaded;
+        let multi_mode = !pr_subset && self.data.session.presentation.prefer_scrolling(total);
+        let open_reviewed_revision = self.data.session.presentation.open_reviewed_revision;
         let view_for_split = cx.weak_entity();
         let view_for_unified = cx.weak_entity();
         let view_for_layout = cx.weak_entity();
         let view_for_scrolling = cx.weak_entity();
-        let view_for_project = cx.weak_entity();
+        let view_for_checkout = cx.weak_entity();
+        let view_for_revision = cx.weak_entity();
         let view_for_all = cx.weak_entity();
         let view_for_unreviewed = cx.weak_entity();
         let unreviewed = self.data.session.presentation.unreviewed_only;
@@ -737,11 +739,38 @@ impl Render for ReviewView {
                                 },
                             )
                             .separator()
-                            .entry("Open in project", None, move |window, cx| {
-                                view_for_project
-                                    .update(cx, |this, cx| this.open_in_project(window, cx))
-                                    .log_err();
-                            })
+                            .toggleable_entry(
+                                "Open File: Current checkout",
+                                !open_reviewed_revision,
+                                ui::IconPosition::Start,
+                                None,
+                                move |window, cx| {
+                                    view_for_checkout
+                                        .update(cx, |this, cx| {
+                                            let mut presentation =
+                                                this.data.session.presentation.clone();
+                                            presentation.open_reviewed_revision = false;
+                                            this.change_presentation(presentation, window, cx);
+                                        })
+                                        .log_err();
+                                },
+                            )
+                            .toggleable_entry(
+                                "Open File: Reviewed revision · read-only",
+                                open_reviewed_revision,
+                                ui::IconPosition::Start,
+                                None,
+                                move |window, cx| {
+                                    view_for_revision
+                                        .update(cx, |this, cx| {
+                                            let mut presentation =
+                                                this.data.session.presentation.clone();
+                                            presentation.open_reviewed_revision = true;
+                                            this.change_presentation(presentation, window, cx);
+                                        })
+                                        .log_err();
+                                },
+                            )
                             .separator()
                             .action("Full PR comparison", ShowFullPRComparison.boxed_clone())
                             .action("Changes since review", ShowChangesSinceReview.boxed_clone())

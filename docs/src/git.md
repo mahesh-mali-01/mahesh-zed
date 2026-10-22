@@ -352,6 +352,23 @@ Configuring a self-hosted provider for links does not enable pull request review
 on GitHub Enterprise, and remote-development projects are not yet supported by
 this workflow.
 
+### File Navigation
+
+Pull requests with more than 50 files default to **Single file**. Smaller pull
+requests show scrolling files. Choose either layout in the view menu; an
+explicit choice is restored with the review.
+
+File contents are read from the fetched Git snapshot. Native buffers and diffs
+are reused, and nearby small files prepare in the background within bounded
+memory and concurrency limits. Large files prepare when selected. Refresh
+updates the snapshot while unchanged immutable contents remain reusable.
+
+Use the copy icon before **Open File** to copy a repository-relative file path.
+The view menu controls whether **Open File** opens the **Current checkout** or
+**Reviewed revision · read-only**. Current checkout is the default and preserves
+unsaved edits in existing buffers. A file absent from the checkout can still be
+inspected by choosing its reviewed revision.
+
 ### Conversation and Commits
 
 The Conversation tab shows the description, comments, reviews and file threads.
