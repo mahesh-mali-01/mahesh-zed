@@ -4676,7 +4676,8 @@ async fn reused_canonical_tab_adopts_fresh_durable_intents_and_preserves_unsaved
 async fn tree_file_checkboxes_align_and_do_not_activate_rows(cx: &mut TestAppContext) {
     let fixture = fixture(cx).await.expect("fixture");
     let (view, mut cx) = review_window(&fixture, cx, None);
-    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending).await;
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
     let editor_id = view.update(&mut cx, |view, cx| {
         view.data.session.selector = ComparisonSelector::PullRequest {
             identity: PullRequestIdentity {
@@ -4688,7 +4689,11 @@ async fn tree_file_checkboxes_align_and_do_not_activate_rows(cx: &mut TestAppCon
         };
         for path in ["src/one.ts", "src/deep/two.ts"] {
             view.data.files.push(path.into());
-            view.data.session.snapshot.groups[0].files.push(comparison(path, b"before\n", b"after\n"));
+            view.data.session.snapshot.groups[0].files.push(comparison(
+                path,
+                b"before\n",
+                b"after\n",
+            ));
         }
         // Hold retention so the actual checkbox handler queues local intent
         // without invoking GitHub or loading the selected file's contents.
@@ -4698,24 +4703,41 @@ async fn tree_file_checkboxes_align_and_do_not_activate_rows(cx: &mut TestAppCon
     });
     cx.run_until_parked();
     let rows = view.read_with(&cx, |view, _| review_tree(&view.effective_data()));
-    let folder_index = rows.iter().position(|row| row.path == "src").expect("folder");
+    let folder_index = rows
+        .iter()
+        .position(|row| row.path == "src")
+        .expect("folder");
     let file_indices = ["auth.ts", "src/one.ts", "src/deep/two.ts"].map(|path| {
-        rows.iter().position(|row| row.path == path).expect("visible file")
+        rows.iter()
+            .position(|row| row.path == path)
+            .expect("visible file")
     });
     let selectors = [
-        "REVIEW_TREE_VIEWED_0", "REVIEW_TREE_VIEWED_1", "REVIEW_TREE_VIEWED_2",
-        "REVIEW_TREE_VIEWED_3", "REVIEW_TREE_VIEWED_4", "REVIEW_TREE_VIEWED_5",
+        "REVIEW_TREE_VIEWED_0",
+        "REVIEW_TREE_VIEWED_1",
+        "REVIEW_TREE_VIEWED_2",
+        "REVIEW_TREE_VIEWED_3",
+        "REVIEW_TREE_VIEWED_4",
+        "REVIEW_TREE_VIEWED_5",
     ];
-    let folder = cx.debug_bounds(selectors[folder_index]).expect("folder checkbox");
+    let folder = cx
+        .debug_bounds(selectors[folder_index])
+        .expect("folder checkbox");
     for index in file_indices {
         let target = cx.debug_bounds(selectors[index]).expect("file checkbox");
-        assert_eq!(target.right(), folder.right(), "file/folder checkbox right edges ignore nesting");
+        assert_eq!(
+            target.right(),
+            folder.right(),
+            "file/folder checkbox right edges ignore nesting"
+        );
         assert_eq!(target.size.width, folder.size.width);
         assert!(target.size.width >= px(24.));
     }
     let nested_index = file_indices[2];
     for edge in 0..5 {
-        let target = cx.debug_bounds(selectors[nested_index]).expect("nested checkbox");
+        let target = cx
+            .debug_bounds(selectors[nested_index])
+            .expect("nested checkbox");
         let position = match edge {
             0 => target.center(),
             1 => gpui::point(target.left() + px(1.), target.center().y),
@@ -4724,38 +4746,146 @@ async fn tree_file_checkboxes_align_and_do_not_activate_rows(cx: &mut TestAppCon
             _ => gpui::point(target.center().x, target.bottom() - px(1.)),
         };
         cx.simulate_mouse_move(position, None, gpui::Modifiers::default());
-        cx.simulate_mouse_down(position, gpui::MouseButton::Left, gpui::Modifiers::default());
-        cx.simulate_mouse_up(position, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_down(
+            position,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            position,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
         view.read_with(&cx, |view, _| {
-            assert_eq!(view.data.session.presentation.selected_path.as_deref(), Some("auth.ts"), "checkbox gestures never activate another file");
+            assert_eq!(
+                view.data.session.presentation.selected_path.as_deref(),
+                Some("auth.ts"),
+                "checkbox gestures never activate another file"
+            );
             assert_eq!(view.editor.as_ref().unwrap().entity_id(), editor_id);
-            assert_eq!(view.github_viewed_pending_clicks.get("src/deep/two.ts"), Some(&(edge % 2 == 0)), "the clicked file toggles, not the selected file");
+            assert_eq!(
+                view.github_viewed_pending_clicks.get("src/deep/two.ts"),
+                Some(&(edge % 2 == 0)),
+                "the clicked file toggles, not the selected file"
+            );
             assert!(!view.github_viewed_pending_clicks.contains_key("auth.ts"));
         });
     }
-    view.update(&mut cx, |view, cx| { view.busy = true; cx.notify(); });
-    cx.run_until_parked();
-    let target = cx.debug_bounds(selectors[nested_index]).expect("disabled nested checkbox");
-    cx.simulate_mouse_down(target.center(), gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.simulate_mouse_up(target.center(), gpui::MouseButton::Left, gpui::Modifiers::default());
     view.update(&mut cx, |view, cx| {
-        assert_eq!(view.data.session.presentation.selected_path.as_deref(), Some("auth.ts"));
-        assert_eq!(view.github_viewed_pending_clicks.get("src/deep/two.ts"), Some(&true));
+        view.busy = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let target = cx
+        .debug_bounds(selectors[nested_index])
+        .expect("disabled nested checkbox");
+    cx.simulate_mouse_down(
+        target.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        target.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    view.update(&mut cx, |view, cx| {
+        assert_eq!(
+            view.data.session.presentation.selected_path.as_deref(),
+            Some("auth.ts")
+        );
+        assert_eq!(
+            view.github_viewed_pending_clicks.get("src/deep/two.ts"),
+            Some(&true)
+        );
         view.busy = false;
         cx.notify();
     });
     cx.run_until_parked();
-    let billing_index = rows.iter().position(|row| row.path == "billing.ts").expect("ordinary row");
+    let billing_index = rows
+        .iter()
+        .position(|row| row.path == "billing.ts")
+        .expect("ordinary row");
     let label_selectors = [
-        "REVIEW_TREE_NAME_0", "REVIEW_TREE_NAME_1", "REVIEW_TREE_NAME_2",
-        "REVIEW_TREE_NAME_3", "REVIEW_TREE_NAME_4", "REVIEW_TREE_NAME_5",
+        "REVIEW_TREE_NAME_0",
+        "REVIEW_TREE_NAME_1",
+        "REVIEW_TREE_NAME_2",
+        "REVIEW_TREE_NAME_3",
+        "REVIEW_TREE_NAME_4",
+        "REVIEW_TREE_NAME_5",
     ];
-    let label = cx.debug_bounds(label_selectors[billing_index]).expect("ordinary row label");
-    cx.simulate_mouse_down(label.center(), gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.simulate_mouse_up(label.center(), gpui::MouseButton::Left, gpui::Modifiers::default());
+    let label = cx
+        .debug_bounds(label_selectors[billing_index])
+        .expect("ordinary row label");
+    cx.simulate_mouse_down(
+        label.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        label.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
     view.read_with(&cx, |view, _| {
-        assert_eq!(view.data.session.presentation.selected_path.as_deref(), Some("billing.ts"), "clicking outside the checkbox still activates the row");
+        assert_eq!(
+            view.data.session.presentation.selected_path.as_deref(),
+            Some("billing.ts"),
+            "clicking outside the checkbox still activates the row"
+        );
         assert!(!view.github_viewed_pending_clicks.contains_key("billing.ts"));
     });
+}
+
+#[gpui::test]
+async fn rendered_tree_navigation_matches_full_navigation_for_hidden_and_filtered_files(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx).await.expect("fixture");
+    let mut data = read_data(&fixture.db, fixture.session.clone()).expect("review data");
+    data.files = [
+        "apps/api/a.ts",
+        "apps/api/b.ts",
+        "docs/review.md",
+        "root.ts",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    data.viewed = BTreeSet::from(["apps/api/a.ts".into(), "docs/review.md".into()]);
+    for unreviewed in [false, true] {
+        data.session.presentation.unreviewed_only = unreviewed;
+        for filter in ["", "API", "docs", "missing"] {
+            data.session.presentation.path_filter = filter.into();
+            for collapsed in [None, Some("apps"), Some("apps/api"), Some("docs")] {
+                data.session.presentation.collapsed_directories =
+                    collapsed.into_iter().map(str::to_owned).collect();
+                let rows = review_tree(&data);
+                let visible = rows
+                    .iter()
+                    .filter(|row| !row.directory)
+                    .map(|row| &row.path)
+                    .collect::<Vec<_>>();
+                for current in [
+                    None,
+                    Some("apps/api/a.ts"),
+                    Some("apps/api/b.ts"),
+                    Some("docs/review.md"),
+                    Some("root.ts"),
+                    Some("missing.ts"),
+                ] {
+                    data.session.presentation.selected_path = current.map(str::to_owned);
+                    assert_eq!(
+                        presentation::tree_navigation_availability(&data, &visible),
+                        (
+                            tree_navigation_target(&data, false).is_some(),
+                            tree_navigation_target(&data, true).is_some()
+                        ),
+                        "navigation equivalence for current {current:?}, filter {filter:?}, collapsed {collapsed:?}, unreviewed {unreviewed}",
+                    );
+                }
+            }
+        }
+    }
 }

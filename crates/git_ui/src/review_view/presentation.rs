@@ -1,5 +1,26 @@
 use super::*;
 
+pub(super) fn tree_navigation_availability(
+    data: &ReviewData,
+    visible_paths: &[&String],
+) -> (bool, bool) {
+    let position = data
+        .session
+        .presentation
+        .selected_path
+        .as_ref()
+        .and_then(|current| visible_paths.iter().position(|path| *path == current));
+    if let Some(position) = position {
+        (position > 0, position + 1 < visible_paths.len())
+    } else {
+        // A collapsed current file still navigates relative to its full tree order.
+        (
+            tree_navigation_target(data, false).is_some(),
+            tree_navigation_target(data, true).is_some(),
+        )
+    }
+}
+
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let total = self.data.files.len();
@@ -104,6 +125,7 @@ impl Render for ReviewView {
             remote.difference(&effective_data.checkpoint_viewed).count()
         });
         let rows = review_tree(&effective_data);
+        let row_depths = rows.iter().map(|row| row.depth).collect::<Vec<_>>();
         let visible_file_paths = rows
             .iter()
             .filter(|row| !row.directory)
@@ -134,8 +156,8 @@ impl Render for ReviewView {
             paths(&effective_data).len(),
             visible_file_paths.len(),
         );
-        let previous_available = tree_navigation_target(&self.data, false).is_some();
-        let next_available = tree_navigation_target(&self.data, true).is_some();
+        let (previous_available, next_available) =
+            tree_navigation_availability(&effective_data, &visible_file_paths);
         let tree_width = self
             .tree_width_preview
             .or(self.data.session.presentation.tree_width)
@@ -302,11 +324,10 @@ impl Render for ReviewView {
                         px(ReviewTreeSettings::get_global(cx).indent_size),
                         ui::IndentGuideColors::panel(cx),
                     ).with_left_offset(ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET)
-                    .with_compute_indents_fn(cx.entity(), |this, range, _, cx| {
+                    .with_compute_indents_fn(cx.entity(), move |this, range, _, cx| {
                         let settings = ReviewTreeSettings::get_global(cx);
                         let max_depth = ((this.current_tree_width() - 180.).max(0.) / settings.indent_size.max(1.)).floor() as usize;
-                        let rows = review_tree(&this.effective_data());
-                        range.filter_map(|index| rows.get(index).map(|row| row.depth.min(max_depth))).collect()
+                        range.filter_map(|index| row_depths.get(index).map(|depth| (*depth).min(max_depth))).collect()
                     }))
                 })
                 .track_scroll(&self.tree_scroll)
