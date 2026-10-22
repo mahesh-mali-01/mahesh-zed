@@ -4708,8 +4708,11 @@ impl ReviewView {
             Ok(())
         })();
         if let Err(error) = result {
-            self.check_error = Some(error.to_string());
-            cx.notify();
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_error(error.to_string(), cx)
+                })
+                .log_err();
         }
     }
 }

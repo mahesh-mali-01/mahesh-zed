@@ -5234,10 +5234,8 @@ async fn current_checkout_open_preserves_unsaved_buffer_and_missing_path_keeps_r
         view.open_current_file("missing.txt", window, cx);
         assert!(view.error.is_none());
         assert!(
-            view.check_error
-                .as_deref()
-                .unwrap()
-                .contains("Reviewed revision")
+            view.check_error.is_none(),
+            "missing local files do not require a PR refresh"
         );
         assert_eq!(view.editor.as_ref().unwrap().entity_id(), review_editor);
         view.open_current_file("billing.ts", window, cx);
