@@ -1,3 +1,3 @@
-# Recovery acceptance baseline
+# Recovery baseline
 
-Disposable generic documentation fixture.
+Target branch advanced for controlled acceptance.
