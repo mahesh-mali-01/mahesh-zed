@@ -1,3 +1,3 @@
 # Recovery baseline
 
-Target branch advanced for controlled acceptance.
+Controlled target advance dbe393d9.
