@@ -5506,7 +5506,7 @@ async fn rejected_guarded_recovery_never_becomes_an_unguarded_pending_click(
     let (view, mut cx) = review_window(&fixture, cx, None);
     cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
         .await;
-    view.update_in(&mut cx, |view, window, cx| {
+    let admission = view.update_in(&mut cx, |view, window, cx| {
         view.data.session.selector = ComparisonSelector::PullRequest {
             identity: PullRequestIdentity {
                 host: "github.com".into(),
@@ -5535,8 +5535,15 @@ async fn rejected_guarded_recovery_never_becomes_an_unguarded_pending_click(
             Some(view.data.session.revision + 1),
             window,
             cx,
-        );
+        )
     });
+    assert!(
+        admission
+            .expect("guarded acceptance task")
+            .await
+            .expect("admission acknowledgement")
+            .is_err()
+    );
     cx.condition(&view, |view, _| {
         !view.github_viewed_preparing && !view.github_viewed_busy
     })
@@ -5548,13 +5555,17 @@ async fn rejected_guarded_recovery_never_becomes_an_unguarded_pending_click(
     });
     view.update_in(&mut cx, |view, window, cx| {
         view.github_viewed_preparing = true;
-        view.set_github_paths_viewed_at_revision(
+        let admission = view.set_github_paths_viewed_at_revision(
             vec!["auth.ts".into()],
             true,
             None,
             Some(view.data.session.revision),
             window,
             cx,
+        );
+        assert!(
+            admission.is_none(),
+            "busy recovery must not acknowledge acceptance"
         );
         assert!(
             view.github_viewed_pending_clicks.is_empty(),

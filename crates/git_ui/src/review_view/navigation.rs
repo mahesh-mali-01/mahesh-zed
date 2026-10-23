@@ -67,8 +67,13 @@ pub(super) fn checkout_definitions(
             let started = Instant::now();
             while !lsp_store.update(cx, |store, cx| {
                 let ids = store.language_server_ids_for_opened_buffer(buffer_id).cloned().unwrap_or_default();
-                let request = project::lsp_command::GetDefinitions { position: offset.to_point_utf16(checkout.read(cx)) };
-                ids.into_iter().any(|id| store.language_server_capable_of_lsp_request(&checkout, id, &request, cx))
+                let position = offset.to_point_utf16(checkout.read(cx));
+                ids.into_iter().any(|id| match kind {
+                    editor::GotoDefinitionKind::Symbol => store.language_server_capable_of_lsp_request(&checkout, id, &project::lsp_command::GetDefinitions { position }, cx),
+                    editor::GotoDefinitionKind::Declaration => store.language_server_capable_of_lsp_request(&checkout, id, &project::lsp_command::GetDeclarations { position }, cx),
+                    editor::GotoDefinitionKind::Type => store.language_server_capable_of_lsp_request(&checkout, id, &project::lsp_command::GetTypeDefinitions { position }, cx),
+                    editor::GotoDefinitionKind::Implementation => store.language_server_capable_of_lsp_request(&checkout, id, &project::lsp_command::GetImplementations { position }, cx),
+                })
             }) {
                 ensure!(started.elapsed() < std::time::Duration::from_secs(5),
                     "The current file's language server is starting or unavailable. Try Go to Definition again, or use Open current file to inspect its language-server status");

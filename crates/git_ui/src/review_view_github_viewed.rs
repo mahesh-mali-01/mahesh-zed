@@ -117,6 +117,9 @@ pub(super) fn remaining_after_read(
     }))
 }
 
+pub(super) type ViewedAdmission =
+    futures::channel::oneshot::Receiver<Result<ReviewOperation, String>>;
+
 pub(super) struct ViewedWork {
     revision: u64,
     imports: Vec<String>,
@@ -342,7 +345,7 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_github_paths_viewed_at_revision(paths, viewed, existing, None, window, cx);
+        let _ = self.set_github_paths_viewed_at_revision(paths, viewed, existing, None, window, cx);
     }
 
     pub(super) fn set_github_paths_viewed_at_revision(
@@ -353,11 +356,11 @@ impl ReviewView {
         expected_revision: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<ViewedAdmission> {
         if expected_revision.is_some() && (self.github_viewed_preparing || self.refreshing) {
             self.github_viewed_error = Some("Recovery was interrupted by another active change. The original action remains tracked; no stale intention was queued.".into());
             cx.notify();
-            return;
+            return None;
         }
         if self.github_viewed_preparing {
             // Preserve every rapid user action while immutable contents are
@@ -366,28 +369,28 @@ impl ReviewView {
                 self.github_viewed_pending_clicks.insert(path, viewed);
             }
             cx.notify();
-            return;
+            return None;
         }
         if self.refreshing {
             for path in paths {
                 self.github_viewed_pending_clicks.insert(path, viewed);
             }
             cx.notify();
-            return;
+            return None;
         }
         let (context, remote) = match self.github_viewed_context() {
             Ok(context) => context,
             Err(error) => {
                 self.github_viewed_error = Some(error.to_string());
                 cx.notify();
-                return;
+                return None;
             }
         };
         let session = self.data.session.clone();
         if let Err(error) = viewed_intent(&session, paths.clone(), viewed) {
             self.github_viewed_error = Some(error.to_string());
             cx.notify();
-            return;
+            return None;
         }
         // Transfer only after context/fingerprint validation. Busy file loading
         // does not block local intent persistence against this pinned snapshot.
@@ -405,6 +408,11 @@ impl ReviewView {
         let recovery = crate::review_outbox_runtime::ready(db.clone(), cx);
         let app = cx.to_async();
         let delivery_db = self.db.clone();
+        let (admission_sender, admission) = expected_revision
+            .map(|_| futures::channel::oneshot::channel())
+            .map_or((None, None), |(sender, receiver)| {
+                (Some(sender), Some(receiver))
+            });
         cx.spawn_in(window, async move |this, cx| {
             let accepted: Result<(ReviewOperation, ReviewSession)> = async {
                 recovery
@@ -482,6 +490,10 @@ impl ReviewView {
                 Ok((operation, accepted_session))
             }
             .await;
+            if let Some(sender) = admission_sender {
+                // A closed recovery view may drop its acknowledgement receiver.
+                let _ = sender.send(accepted.as_ref().map(|(operation, _)| operation.clone()).map_err(|error| error.to_string()));
+            }
             let delivery = accepted.as_ref().ok().map(|(operation, session)| {
                 app.update(|cx| {
                     enqueue_viewed_delivery(
@@ -567,6 +579,7 @@ impl ReviewView {
         })
         .detach();
         cx.notify();
+        admission
     }
 
     fn observe_github_viewed_delivery(

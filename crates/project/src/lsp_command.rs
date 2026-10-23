@@ -187,12 +187,12 @@ pub(crate) struct GetEditPredictionDefinitions {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct GetDeclarations {
+pub struct GetDeclarations {
     pub position: PointUtf16,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct GetTypeDefinitions {
+pub struct GetTypeDefinitions {
     pub position: PointUtf16,
 }
 
@@ -202,7 +202,7 @@ pub(crate) struct GetEditPredictionTypeDefinitions {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct GetImplementations {
+pub struct GetImplementations {
     pub position: PointUtf16,
 }
 

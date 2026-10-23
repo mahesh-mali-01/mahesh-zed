@@ -314,22 +314,20 @@ impl ReviewView {
                             .map(|(path, _)| path.clone()).collect::<Vec<_>>();
                         if paths.is_empty() { continue; }
                         status(&view, format!("Recovering {} unchanged file intentions in a batch…", paths.len()), cx)?;
-                        let prior_revisions = fresh.iter().map(|op| (op.operation_id.clone(), op.revision)).collect::<BTreeMap<_, _>>();
-                        view.update_in(cx, |view, window, cx| view.set_github_paths_viewed_at_revision(paths.clone(), desired, None, Some(fresh_session.revision), window, cx))?;
+                        let admission = view.update_in(cx, |view, window, cx| view.set_github_paths_viewed_at_revision(paths.clone(), desired, None, Some(fresh_session.revision), window, cx))?
+                            .context("Recovery admission was rejected; original intentions remain tracked")?;
+                        let admitted = admission.await.context("Recovery admission was interrupted")?.map_err(anyhow::Error::msg)?;
                         wait_idle(&view, cx).await?;
-                        let accepted = cx.background_spawn({ let db = db.clone(); let identity = context.identity()?.clone(); async move { db.operations(&identity) } }).await?;
-                        // Do not archive the old intent until a replacement was
-                        // actually persisted, regardless of its network outcome.
-                        for operation in accepted.iter().filter(|op| prior_revisions.get(&op.operation_id).is_none_or(|revision| *revision < op.revision) && op.context == context && op.kind == ReviewOperationKind::SetFileViewed) {
-                            if let Ok(intent) = serde_json::from_value::<GitHubViewedIntent>(operation.payload.clone()) {
-                                if intent.viewed == desired && intent.validate_for(&session).is_ok() {
-                                    if operation.state == ReviewOperationState::Sent {
-                                        retried += intent.paths.len();
-                                    } else { attention += 1; }
-                                    durably_replaced.extend(intent.paths);
-                                }
-                            }
-                        }
+                        let operation = wait_operation(db.clone(), admitted.operation_id.clone(), cx).await?;
+                        ensure!(operation.context == context && operation.revision >= admitted.revision && operation.kind == ReviewOperationKind::SetFileViewed,
+                            "Admitted recovery operation changed context; original intentions remain tracked");
+                        let intent: GitHubViewedIntent = serde_json::from_value(operation.payload)?;
+                        ensure!(intent.viewed == desired, "A newer Viewed intention replaced this recovery; original intentions remain tracked");
+                        intent.validate_for(&session)?;
+                        let acknowledged = paths.into_iter().filter(|path| intent.paths.contains(path)).collect::<Vec<_>>();
+                        ensure!(!acknowledged.is_empty(), "Recovery acknowledgement did not cover the admitted paths");
+                        if operation.state == ReviewOperationState::Sent { retried += acknowledged.len(); } else { attention += 1; }
+                        durably_replaced.extend(acknowledged);
                     }
                     let final_operations = cx.background_spawn({ let db = db.clone(); let identity = context.identity()?.clone(); async move { db.operations(&identity) } }).await?;
                     let final_latest = latest_viewed_intentions(&final_operations, &context, &session);
