@@ -74,6 +74,17 @@ impl ReviewDb {
             .map(|id| read_operation(self, &id))
             .collect()
     }
+    pub(crate) fn archived_operation_ids(
+        &self,
+        identity: &PullRequestIdentity,
+    ) -> Result<Vec<String>> {
+        ensure_durable(self)?;
+        identity.validate()?;
+        self.select_bound::<String, String>(
+            "SELECT a.operation_id FROM review_operation_archives a JOIN review_operations o ON o.id = a.operation_id WHERE o.identity = ?",
+        )?(serde_json::to_string(identity)?)
+    }
+
     /// Archive local tracking atomically. A sending request must settle first;
     /// unknown delivery is never converted to a definitely-unsent state.
     pub async fn archive_operation(&self, id: String, expected_revision: u64) -> Result<()> {

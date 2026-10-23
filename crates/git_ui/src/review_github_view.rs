@@ -460,6 +460,21 @@ impl GitHubReviewPanel {
         self.bulk_status = Some(status);
         cx.notify();
     }
+    pub(crate) fn recovery_presentation(&self) -> (bool, bool, Option<String>) {
+        (
+            self.pending_actions_mode,
+            self.bulk_running,
+            self.bulk_status.clone(),
+        )
+    }
+    pub(crate) fn restore_recovery_presentation(&mut self, state: (bool, bool, Option<String>)) {
+        (
+            self.pending_actions_mode,
+            self.bulk_running,
+            self.bulk_status,
+        ) = state;
+    }
+
     pub(crate) fn delivery_busy(&self) -> bool {
         self.writing
     }
@@ -1591,7 +1606,7 @@ impl GitHubReviewPanel {
     ) {
         let unknown = operation.state == ReviewOperationState::DeliveryUnknown;
         let answer = window.prompt(gpui::PromptLevel::Warning,
-            if unknown { "Stop tracking this unconfirmed action?" } else { "Cancel this queued action?" },
+            if unknown { "Stop tracking this unconfirmed action?" } else { "Cancel this unsent action?" },
             Some(if unknown { "This archives local tracking only. GitHub may already contain the change; it will not be undone or resent." }
                  else { "The action will be archived locally. An already sending request cannot be cancelled." }),
             &[if unknown { "Stop tracking" } else { "Cancel action" }, "Keep action"], cx);
@@ -1611,9 +1626,7 @@ impl GitHubReviewPanel {
                 .update(cx, |panel, cx| {
                     match result {
                         Ok(()) => {
-                            panel
-                                .operations
-                                .retain(|operation| operation.operation_id != id);
+                            panel.adopt_archived_operations(vec![id.clone()]);
                             if panel
                                 .draft
                                 .as_ref()
@@ -1881,16 +1894,28 @@ impl GitHubReviewPanel {
         self.inline_composer = false;
         cx.notify();
     }
+    fn adopt_archived_operations(&mut self, archived: Vec<String>) {
+        self.superseded_operations.extend(archived);
+        self.operations
+            .retain(|operation| !self.superseded_operations.contains(&operation.operation_id));
+    }
+
     pub(crate) fn reload_local_operations(&mut self, cx: &mut Context<Self>) {
         let db = self.db.clone();
         let identity = self.remote.identity.clone();
         cx.spawn(async move |this, cx| {
             let operations = cx
-                .background_spawn(async move { db.operations(&identity) })
+                .background_spawn(async move {
+                    Ok::<_, anyhow::Error>((
+                        db.operations(&identity)?,
+                        db.archived_operation_ids(&identity)?,
+                    ))
+                })
                 .await;
             this.update(cx, |this, cx| {
                 match operations {
-                    Ok(operations) => {
+                    Ok((operations, archived)) => {
+                        this.adopt_archived_operations(archived);
                         for operation in operations {
                             this.upsert_operation(operation);
                         }

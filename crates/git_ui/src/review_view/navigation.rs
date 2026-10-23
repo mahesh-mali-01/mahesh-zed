@@ -57,6 +57,19 @@ pub(super) fn checkout_definitions(
             }).await;
             ensure!(matches,
                 "Reviewed contents differ from the current checkout. Use Open current file for Go to Definition; historical positions were not sent to the language server");
+            // Invisible checkout buffers are not registered by Editor::register_buffer.
+            // Hold the same native registration handle only for this user request.
+            let _registration = project.update(cx, |project, cx| {
+                project.register_buffer_with_language_servers(&checkout, cx)
+            });
+            let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+            let buffer_id = checkout.read_with(cx, |buffer, _| buffer.remote_id());
+            let started = Instant::now();
+            while !lsp_store.read_with(cx, |store, _| store.language_server_ids_for_opened_buffer(buffer_id).is_some_and(|ids| !ids.is_empty())) {
+                ensure!(started.elapsed() < std::time::Duration::from_secs(5),
+                    "The current file's language server is starting or unavailable. Try Go to Definition again, or use Open current file to inspect its language-server status");
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+            }
             let task = project.update(cx, |project, cx| {
                 ensure!(checkout.read(cx).version() == expected_version,
                     "The checkout changed during navigation. Try again from the current file");

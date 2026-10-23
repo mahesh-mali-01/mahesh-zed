@@ -1061,9 +1061,17 @@ impl Render for GitHubReviewPanel {
             if let Some(status) = &self.bulk_status {
                 content = content.child(
                     h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_start()
                         .gap_2()
                         .when(self.bulk_running, |row| row.child(ui::SpinnerLabel::new()))
-                        .child(Label::new(status.clone()).size(LabelSize::Small)),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Label::new(status.clone()).size(LabelSize::Small)),
+                        ),
                 );
             }
         }
@@ -1395,12 +1403,14 @@ impl Render for GitHubReviewPanel {
                     })),
                 );
             }
-            if matches!(
-                operation.state,
-                ReviewOperationState::LocalDraft
-                    | ReviewOperationState::Failed
-                    | ReviewOperationState::Queued
-            ) {
+            if operation.kind != ReviewOperationKind::SetFileViewed
+                && matches!(
+                    operation.state,
+                    ReviewOperationState::LocalDraft
+                        | ReviewOperationState::Failed
+                        | ReviewOperationState::Queued
+                )
+            {
                 let draft = operation.clone();
                 row = row.child(
                     Button::new(
@@ -1434,12 +1444,20 @@ impl Render for GitHubReviewPanel {
                             "github-delete-draft:{}",
                             operation.operation_id
                         )),
-                        "Discard local draft…",
+                        if operation.kind == ReviewOperationKind::SetFileViewed {
+                            "Cancel unsent action…"
+                        } else {
+                            "Discard local draft…"
+                        },
                     )
                     .style(ButtonStyle::Tinted(TintColor::Error))
-                    .disabled(self.writing)
+                    .disabled(self.writing || self.bulk_running)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.discard_draft(draft.clone(), window, cx)
+                        if draft.kind == ReviewOperationKind::SetFileViewed {
+                            this.archive_local_action(draft.clone(), window, cx)
+                        } else {
+                            this.discard_draft(draft.clone(), window, cx)
+                        }
                     })),
                 );
             }

@@ -1284,9 +1284,19 @@ impl ReviewView {
             self.github_panel_error = Some(format!("GitHub review unavailable: {error:#}"));
             return;
         }
+        let recovery_presentation = self
+            .github_panel
+            .as_ref()
+            .filter(|panel| &panel.read(cx).remote_context().identity == identity)
+            .map(|panel| panel.read(cx).recovery_presentation());
         let identity = identity.clone();
-        let panel =
-            cx.new(|cx| GitHubReviewPanel::new(self.db.clone(), context, identity, window, cx));
+        let panel = cx.new(|cx| {
+            let mut panel = GitHubReviewPanel::new(self.db.clone(), context, identity, window, cx);
+            if let Some(state) = recovery_presentation {
+                panel.restore_recovery_presentation(state);
+            }
+            panel
+        });
         // Construction errors must leave the local comparison usable.
         {
             {

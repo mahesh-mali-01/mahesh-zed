@@ -1315,3 +1315,40 @@ fn github_review_delete_absence_receipt_reconciles_without_claiming_a_present_id
     assert!(operation.server_ids.is_empty());
     Ok(())
 }
+
+#[gpui::test]
+async fn recovery_archive_removes_cards_and_rejects_late_acknowledgements(cx: &mut TestAppContext) {
+    let (_directory, db) = database(cx).await;
+    let context = context();
+    let identity = context.identity().unwrap().clone();
+    let draft = db
+        .create_operation(
+            context.clone(),
+            ReviewOperationKind::PostInlineComment,
+            json!({"body":"Keep draft"}),
+            ReviewLocationState::Ready,
+        )
+        .await
+        .unwrap();
+    let queued = db
+        .queue_operation(draft.operation_id.clone(), draft.revision)
+        .await
+        .unwrap();
+    db.archive_operation(queued.operation_id.clone(), queued.revision)
+        .await
+        .unwrap();
+    let archived = db.archived_operation_ids(&identity).unwrap();
+    let (panel, cx) =
+        cx.add_window_view(|window, cx| GitHubReviewPanel::new(db, context, identity, window, cx));
+    panel.update(cx, |panel, _| {
+        panel.operations = vec![queued.clone()];
+        panel.adopt_archived_operations(archived);
+        panel.upsert_operation(queued);
+        assert!(panel.operations.is_empty());
+        assert_eq!(panel.pending_action_count(), 0);
+        panel.restore_recovery_presentation((true, true, Some("Recovering…".into())));
+        let state = panel.recovery_presentation();
+        assert!(state.0 && state.1);
+        assert_eq!(state.2.as_deref(), Some("Recovering…"));
+    });
+}
