@@ -255,13 +255,14 @@ impl ReviewView {
                 let mut verified = 0;
                 let mut retried = 0;
                 let mut attention = 0;
+                let mut incompatible_viewed = 0;
                 if matches!(action, RecoveryAction::DiscardUnsent | RecoveryAction::StopTracking) {
                     for operation in operations.into_iter().filter(|op| removable(action, op.state)) {
                         let id = operation.operation_id.clone();
                         let outcome = cx.background_spawn({ let db = db.clone(); async move { db.archive_operation(id, operation.revision).await } }).await;
                         if outcome.is_ok() { removed += 1; } else { attention += 1; }
                     }
-                    return Ok(format!("{removed} actions archived locally · {attention} changed or in-flight actions left tracked. GitHub was not modified."));
+                    return Ok(format!("Archived locally: {removed} · Changed or in-flight actions still tracked: {attention}. GitHub was not modified."));
                 }
                 // One explicit preflight, before admitting any recovery writes.
                 cx.background_spawn({ let remote = remote.clone(); async move {
@@ -292,7 +293,7 @@ impl ReviewView {
                     let mut eligible = Vec::new();
                     let mut retry_paths = BTreeMap::new();
                     for operation in operations.iter().filter(|op| op.kind == ReviewOperationKind::SetFileViewed && op.state == ReviewOperationState::Failed) {
-                        if !viewed_retry_matches(operation, &context, &session) { attention += 1; continue; }
+                        if !viewed_retry_matches(operation, &context, &session) { attention += 1; incompatible_viewed += 1; continue; }
                         let intent: GitHubViewedIntent = serde_json::from_value(operation.payload.clone())?;
                         for path in intent.paths {
                             if latest.get(&path).is_some_and(|(id, _)| id == &operation.operation_id) {
@@ -357,7 +358,10 @@ impl ReviewView {
                 let outstanding = cx.background_spawn({ let db = db.clone(); async move {
                     Ok::<_, anyhow::Error>(db.operations(&identity)?.iter().filter(|operation| !matches!(operation.state, ReviewOperationState::LocalDraft | ReviewOperationState::Sent)).count())
                 }}).await?;
-                Ok(format!("{retried} retried changes confirmed · {verified} earlier deliveries verified · {outstanding} actions pending · {attention} need attention. Drafts remain local."))
+                let guidance = if incompatible_viewed > 0 {
+                    " Some earlier Viewed actions no longer match this comparison. Review the current files before marking them again."
+                } else { "" };
+                Ok(format!("Retried changes confirmed: {retried} · Earlier deliveries verified: {verified} · Pending actions: {outstanding} · Need attention: {attention}. Drafts remain local.{guidance}"))
             }.await;
             view.update(cx, |view, cx| {
                 view.recovery_running = false;
