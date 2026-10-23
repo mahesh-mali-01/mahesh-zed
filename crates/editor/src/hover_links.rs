@@ -291,11 +291,7 @@ impl Editor {
             _ => true,
         });
         let definitions = (refresh && self.lsp_data_enabled() && point.as_valid().is_some())
-            .then(|| {
-                self.semantics_provider
-                    .as_ref()?
-                    .definitions(&buffer, anchor, kind, cx)
-            })
+            .then(|| self.definitions_for_buffer(&buffer, anchor, kind, cx))
             .flatten();
         if let Some(definitions) = definitions {
             let workspace = self.workspace().map(|workspace| workspace.downgrade());
@@ -611,9 +607,9 @@ pub fn show_link_definition(
                     // Always also collect LSP definitions so that cmd-click
                     // reveals every applicable target (e.g. a position that
                     // carries both a document link and a definition).
-                    if let Some(provider) = provider {
-                        let task = cx.update(|_, cx| {
-                            provider.definitions(&buffer, anchor, preferred_kind, cx)
+                    if provider.is_some() {
+                        let task = this.update(cx, |editor, cx| {
+                            editor.definitions_for_buffer(&buffer, anchor, preferred_kind, cx)
                         })?;
                         if let Some(task) = task
                             && let Some(definition_result) = task.await.ok().flatten()

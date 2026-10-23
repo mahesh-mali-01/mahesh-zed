@@ -108,8 +108,11 @@ mod github_viewed;
 
 #[path = "review_view_coverage.rs"]
 mod coverage;
+mod navigation;
 mod preparation;
 mod presentation;
+mod recovery;
+pub(crate) use recovery::RecoveryAction;
 
 const GROUP: &str = "comparison";
 // Bound raw old + new preview bytes before loading either historical blob.
@@ -987,6 +990,9 @@ pub struct ReviewView {
     data: ReviewData,
     path_input: Entity<InputField>,
     path_filter_task: Option<Task<()>>,
+    recovery_task: Option<Task<()>>,
+    progress_reload_task: Option<Task<()>>,
+    recovery_running: bool,
     history_request: u64,
     history_loading: bool,
     history_error: Option<String>,
@@ -1104,6 +1110,16 @@ struct ReviewFileHeaderAddon {
 }
 
 impl editor::Addon for ReviewFileHeaderAddon {
+    fn definitions(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        position: text::Anchor,
+        kind: editor::GotoDefinitionKind,
+        cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<project::LocationLink>>>>> {
+        navigation::checkout_definitions(&self.review, buffer, position, kind, cx)
+    }
+
     fn to_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1194,7 +1210,8 @@ impl editor::Addon for ReviewFileHeaderAddon {
         let full_pr = view.data.session.selector.supports_github_viewed();
         let is_selected = view.data.session.presentation.selected_path.as_ref() == Some(&path);
         let viewed = view.effective_github_viewed(&path);
-        let disabled = view.busy
+        let disabled = view.recovery_running
+            || view.busy
             || view.checking
             || view.refreshing
             || view.outdated()
@@ -1281,11 +1298,17 @@ impl ReviewView {
                     window,
                     |this, _, event, window, cx| {
                         match event {
+                            GitHubReviewEvent::LocalOperationsChanged => {
+                                this.reload_shared_progress(cx)
+                            }
                             GitHubReviewEvent::ThreadsChanged => {
                                 this.capture_github_selection(cx);
                                 this.rebuild_github_blocks(window, cx)
                             }
                             GitHubReviewEvent::Compose => this.rebuild_github_blocks(window, cx),
+                            GitHubReviewEvent::Recover(action) => {
+                                this.start_recovery(*action, false, window, cx)
+                            }
                             GitHubReviewEvent::ClosePanel => {
                                 this.github_open = false;
                                 cx.notify();
@@ -2743,6 +2766,7 @@ impl ReviewView {
                     && event.revision > this.data.session.revision
                 {
                     this.observed_revision = this.observed_revision.max(event.revision);
+                    this.reload_shared_progress(cx);
                     cx.notify();
                 }
             }),
@@ -2803,6 +2827,9 @@ impl ReviewView {
         let mut view = Self {
             path_input,
             path_filter_task: None,
+            recovery_task: None,
+            progress_reload_task: None,
+            recovery_running: false,
             history_request: 0,
             history_loading: false,
             history_error: None,
@@ -2959,6 +2986,36 @@ impl ReviewView {
             })
             .cloned();
         data
+    }
+
+    fn reload_shared_progress(&mut self, cx: &mut Context<Self>) {
+        let db = self.db.clone();
+        let id = self.data.session.id.clone();
+        self.progress_reload_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(20))
+                .await;
+            let result = cx
+                .background_spawn(async move { read_data(&db, db.load_session(&id)?) })
+                .await;
+            view.update(cx, |view, cx| {
+                if let Ok(mut data) = result {
+                    // New snapshots remain pinned until an explicit Refresh.
+                    // Progress-only changes can be adopted without rebuilding buffers.
+                    if data.session.selector == view.data.session.selector
+                        && data.session.snapshot.generation == view.data.session.snapshot.generation
+                        && data.session.revision >= view.data.session.revision
+                    {
+                        data.session.presentation = view.data.session.presentation.clone();
+                        view.observed_revision = view.observed_revision.max(data.session.revision);
+                        view.github_viewed_intents = data.durable_viewed_intents.clone();
+                        view.data = data;
+                        cx.notify();
+                    }
+                }
+            })
+            .log_err();
+        }));
     }
 
     fn outdated(&self) -> bool {
@@ -4016,9 +4073,9 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.outdated() {
-            return;
-        }
+        // Navigation uses the immutable snapshot already displayed. A newer
+        // durable revision blocks writes, not reading, selection or expansion.
+        let persist_navigation = !self.outdated();
         let before = self.data.session.presentation.clone();
         let reload = before.selected_path != presentation.selected_path
             || before.selected_group != presentation.selected_group
@@ -4066,7 +4123,7 @@ impl ReviewView {
         let db = self.db.clone();
         let id = self.data.session.id.clone();
         let generation = self.data.session.snapshot.generation;
-        self.navigation_pending = true;
+        self.navigation_pending = persist_navigation;
         self.navigation_sequence = self.navigation_sequence.saturating_add(1);
         let sequence = self.navigation_sequence;
         self.presentation_task = Some(cx.spawn(async move |this, cx| {
@@ -4074,9 +4131,13 @@ impl ReviewView {
                 .timer(std::time::Duration::from_millis(150))
                 .await;
             let result = cx
-                .background_spawn(
-                    async move { db.save_navigation(id, generation, presentation).await },
-                )
+                .background_spawn(async move {
+                    if persist_navigation {
+                        db.save_navigation(id, generation, presentation).await
+                    } else {
+                        Ok(())
+                    }
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if sequence == this.navigation_sequence {
@@ -4316,7 +4377,12 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.cached_unverified || self.busy || self.outdated() || self.error.is_some() {
+        if self.recovery_running
+            || self.cached_unverified
+            || self.busy
+            || self.outdated()
+            || self.error.is_some()
+        {
             return;
         }
         let Some(path) = self.data.session.presentation.selected_path.clone() else {
@@ -4457,9 +4523,6 @@ impl ReviewView {
     }
 
     fn set_tree_width(&mut self, width: Option<f32>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.outdated() {
-            return;
-        }
         let mut presentation = self.data.session.presentation.clone();
         presentation.tree_width =
             width.map(|width| bounded_tree_width(width, f32::from(window.viewport_size().width)));

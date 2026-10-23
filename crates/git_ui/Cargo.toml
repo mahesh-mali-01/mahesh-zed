@@ -65,6 +65,7 @@ sysinfo.workspace = true
 task.workspace = true
 telemetry.workspace = true
 terminal.workspace = true
+text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 time.workspace = true

@@ -39,10 +39,13 @@ pub(super) fn check_guard(data: &Value, pr: Option<&Value>, context: &ReviewCont
         "GitHub repository identity changed"
     );
     ensure!(
-        pr.get("headRefOid").and_then(Value::as_str) == Some(context.head_oid.as_str())
-            && pr.pointer("/baseRef/target/oid").and_then(Value::as_str)
-                == Some(context.base_tip_oid.as_str()),
-        "PR branches changed; refresh before continuing"
+        pr.get("headRefOid").and_then(Value::as_str) == Some(context.head_oid.as_str()),
+        "The PR head changed on GitHub. Refresh this review before sending changes"
+    );
+    ensure!(
+        pr.pointer("/baseRef/target/oid").and_then(Value::as_str)
+            == Some(context.base_tip_oid.as_str()),
+        "The PR target branch advanced on GitHub. Refresh this review; your local branch does not need to change"
     );
     Ok(())
 }

@@ -151,6 +151,13 @@ impl Domain for ReviewDb {
             PRIMARY KEY(session_id, file_key)
         ) STRICT;
     "#,
+        r#"
+        CREATE TABLE review_operation_archives (
+            operation_id TEXT PRIMARY KEY NOT NULL REFERENCES review_operations(id) ON DELETE CASCADE,
+            archived_at INTEGER NOT NULL,
+            reason TEXT NOT NULL
+        ) STRICT;
+    "#,
     ];
 }
 

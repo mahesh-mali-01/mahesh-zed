@@ -84,3 +84,23 @@ prioritizes nearby files, skips large previews, and stops before filling the
 bounded cache. Both byte and entry limits apply, including metadata charges for
 empty files. Snapshot generation is checked after asynchronous probes before
 warming can start more work.
+
+## Recovery and checkout navigation
+
+`review_view::recovery` coordinates explicit, active-PR bulk recovery. Failed
+Viewed intentions are eligible only when the current file fingerprint matches.
+Every newer per-path durable intention is an ordering barrier, including sent
+and unknown outcomes. Admission uses a strict session revision after background
+retention; a rejected recovery never becomes an ordinary pending click.
+
+`review_operation_archives` retains local cancellation and stop-tracking history.
+Archived actions are excluded from dispatch, optimistic projections and active
+pending counts. Archival is revision-guarded and cannot transition Sending.
+Unknown delivery remains unknown in the audit record and is not replayed.
+
+`review_view::navigation` bridges immutable review buffers to native definition
+lookup on demand. The checkout and reviewed texts must match, and the checkout
+version is checked before dispatching the LSP request. The shared editor Addon
+hook defaults to the existing semantics provider for other editor instances.
+Both review and checkout navigation inputs have a bounded text budget. Historic
+buffers never enter editable path-only buffer storage.

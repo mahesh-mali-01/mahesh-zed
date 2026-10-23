@@ -257,7 +257,7 @@ fn unresolved_paths(
         .context("Not a PR session")?;
     let current_metadata = metadata(connection, session)?;
     let ids = connection.select_bound::<String, String>(
-        "SELECT id FROM review_operations WHERE identity = ? AND state != 'sent'",
+        "SELECT id FROM review_operations WHERE identity = ? AND NOT EXISTS (SELECT 1 FROM review_operation_archives a WHERE a.operation_id = review_operations.id) AND state != 'sent'",
     )?(serde_json::to_string(identity)?)?;
     let mut paths = BTreeSet::new();
     for id in ids {
@@ -381,7 +381,7 @@ fn apply_confirmed_receipt(
     );
     let group = &session.snapshot.groups[0].endpoints.group;
     let unknown_ids = connection.select_bound::<String, String>(
-        "SELECT id FROM review_operations WHERE identity = ? AND state = 'delivery_unknown'",
+        "SELECT id FROM review_operations WHERE identity = ? AND NOT EXISTS (SELECT 1 FROM review_operation_archives a WHERE a.operation_id = review_operations.id) AND state = 'delivery_unknown'",
     )?(serde_json::to_string(&context.identity)?)?;
     let mut older_unknowns = Vec::new();
     for id in unknown_ids {
@@ -521,7 +521,7 @@ impl ReviewDb {
                 // must get its own operation and run after it.
                 let existing = if existing.is_some() { existing } else {
                     let ids = connection.select_bound::<String, String>(
-                        "SELECT id FROM review_operations WHERE identity = ? AND state = 'queued' ORDER BY id DESC",
+                        "SELECT id FROM review_operations WHERE identity = ? AND NOT EXISTS (SELECT 1 FROM review_operation_archives a WHERE a.operation_id = review_operations.id) AND state = 'queued' ORDER BY id DESC",
                     )?(serde_json::to_string(context.identity()?)?)?;
                     let mut reusable = None;
                     let mut newer_paths = BTreeSet::new();

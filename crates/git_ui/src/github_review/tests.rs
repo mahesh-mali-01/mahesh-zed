@@ -1152,3 +1152,25 @@ fn production_review_service_roundtrip() -> Result<()> {
     preservation?;
     outcome
 }
+
+#[test]
+fn branch_guard_distinguishes_head_change_from_target_advance() {
+    let context = context();
+    for (field, expected) in [
+        ("head", "PR head changed"),
+        ("base", "PR target branch advanced"),
+    ] {
+        let mut response = guarded(&context);
+        if field == "head" {
+            response["node"]["headRefOid"] = json!("c".repeat(40));
+        } else {
+            response["node"]["baseRef"]["target"]["oid"] = json!("d".repeat(40));
+        }
+        let transport = FakeTransport::new(vec![Ok(response)]);
+        let error = ReviewService::new(&transport)
+            .verify_context(&context)
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(transport.calls.borrow().len(), 1);
+    }
+}

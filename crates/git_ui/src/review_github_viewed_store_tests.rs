@@ -542,7 +542,47 @@ fn github_viewed_migration_from_outbox_schema_keeps_checkpoints_and_operations()
         }
     }))?;
     block_on(db.mark_viewed(file_target(&session)?, bytes(b"first\n"), 1024))?;
-    let op = operation(&db, &session, &metadata, true, false)?;
+    // Seed a row produced by the historical outbox rather than invoking
+    // current transition writers, which require the archive migration.
+    let mut op = block_on(
+        db.create_operation(
+            ReviewOperationContext {
+                selector: session.selector.clone(),
+                metadata,
+            },
+            ReviewOperationKind::SetFileViewed,
+            serde_json::to_value(GitHubViewedIntent {
+                origin: Some(target(&session)),
+                paths: vec!["src/example.rs".into()],
+                viewed: true,
+                fingerprints: BTreeMap::from([(
+                    "src/example.rs".into(),
+                    session
+                        .snapshot
+                        .file("comparison", "src/example.rs")?
+                        .fingerprint()?,
+                )]),
+            })?,
+            ReviewLocationState::NotRequired,
+        ),
+    )?;
+    op.revision = 3;
+    op.state = ReviewOperationState::DeliveryUnknown;
+    op.last_error = Some("Confirmation unavailable".into());
+    block_on(db.write({
+        let op = op.clone();
+        move |connection| -> Result<()> {
+            connection.exec_bound::<(i64, String, String, String)>(
+                "UPDATE review_operations SET revision=?, state=?, record=? WHERE id=?",
+            )?((
+                op.revision as i64,
+                op.state.as_str().into(),
+                serde_json::to_string(&op)?,
+                op.operation_id,
+            ))?;
+            Ok(())
+        }
+    }))?;
     drop(db);
     let upgraded = open(&path)?;
     assert_eq!(

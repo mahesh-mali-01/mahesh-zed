@@ -5295,3 +5295,271 @@ async fn switching_files_during_started_git_read_releases_admission_and_rejects_
         assert!(!editor.read(cx).text(cx).contains("reviewed auth"));
     });
 }
+
+#[gpui::test]
+async fn newer_progress_does_not_block_pinned_file_or_folder_navigation(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let revision = view.read_with(&cx, |view, _| view.data.session.revision);
+    for index in 0..24 {
+        let path = if index % 2 == 0 {
+            "auth.ts"
+        } else {
+            "billing.ts"
+        };
+        view.update_in(&mut cx, |view, window, cx| {
+            view.observed_revision = revision + 1;
+            view.github_viewed_busy = true;
+            let mut presentation = view.data.session.presentation.clone();
+            presentation.selected_path = Some(path.into());
+            if index % 2 == 0 {
+                presentation.collapsed_directories.insert("folder".into());
+            } else {
+                presentation.collapsed_directories.remove("folder");
+            }
+            view.change_presentation(presentation, window, cx);
+            assert_eq!(
+                view.data.session.presentation.selected_path.as_deref(),
+                Some(path)
+            );
+            assert_eq!(
+                view.data
+                    .session
+                    .presentation
+                    .collapsed_directories
+                    .contains("folder"),
+                index % 2 == 0
+            );
+            assert!(
+                !view.navigation_pending,
+                "stale navigation must not write to the newer generation"
+            );
+        });
+    }
+    assert_eq!(
+        fixture
+            .db
+            .load_session(&fixture.session.id)
+            .unwrap()
+            .revision,
+        revision
+    );
+}
+
+#[gpui::test]
+async fn recovery_only_carries_identical_file_fingerprints_for_the_same_account(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx).await.unwrap();
+    let mut session = fixture.session;
+    session.selector = ComparisonSelector::PullRequest {
+        identity: PullRequestIdentity {
+            host: "github.com".into(),
+            repository_node_id: "R_example".into(),
+            pull_request_node_id: "PR_example".into(),
+            viewer_node_id: "U_example".into(),
+        },
+    };
+    let endpoints = &session.snapshot.groups[0].endpoints;
+    let context = ReviewOperationContext {
+        selector: session.selector.clone(),
+        metadata: PullRequestMetadata {
+            owner: "example".into(),
+            repository: "repository".into(),
+            number: 42,
+            title: "Review".into(),
+            base_ref_name: "main".into(),
+            head_ref_name: "feature".into(),
+            base_ref_oid: endpoints.left.hex.clone(),
+            head_ref_oid: endpoints.right.hex.clone(),
+            commit_count: Some(1),
+        },
+    };
+    let intent = github_viewed::viewed_intent(&session, vec!["auth.ts".into()], true).unwrap();
+    let mut old_context = context.clone();
+    old_context.metadata.base_ref_oid = "9".repeat(40);
+    let mut operation = ReviewOperation {
+        operation_id: "test".into(),
+        revision: 0,
+        context: old_context,
+        kind: ReviewOperationKind::SetFileViewed,
+        payload: serde_json::to_value(intent).unwrap(),
+        location: ReviewLocationState::NotRequired,
+        state: ReviewOperationState::Failed,
+        before_server_ids: vec![],
+        server_ids: vec![],
+        last_error: None,
+        created_at_unix_seconds: 1,
+        updated_at_unix_seconds: 1,
+    };
+    assert!(recovery::viewed_retry_matches(
+        &operation, &context, &session
+    ));
+    for barrier in [
+        ReviewOperationState::Sent,
+        ReviewOperationState::Queued,
+        ReviewOperationState::Sending,
+        ReviewOperationState::DeliveryUnknown,
+        ReviewOperationState::LocalDraft,
+    ] {
+        let mut newer = operation.clone();
+        newer.operation_id = "newer".into();
+        newer.state = barrier;
+        newer.payload["viewed"] = json!(false);
+        newer.payload["origin"]["expected_revision"] = json!(session.revision + 10);
+        let latest =
+            recovery::latest_viewed_intentions(&[operation.clone(), newer], &context, &session);
+        assert_eq!(
+            latest["auth.ts"],
+            ("newer".into(), false),
+            "newer {barrier:?} must block stale retry"
+        );
+    }
+    let mut reused_id = operation.clone();
+    reused_id.operation_id = "aaa-old-uuid".into();
+    reused_id.payload["origin"]["expected_revision"] = json!(session.revision + 20);
+    let latest =
+        recovery::latest_viewed_intentions(&[operation.clone(), reused_id], &context, &session);
+    assert_eq!(
+        latest["auth.ts"].0, "aaa-old-uuid",
+        "acceptance revision must precede UUID ordering"
+    );
+    let mut foreign = operation.clone();
+    foreign.payload["origin"]["session"] = json!("another checkout");
+    assert!(!recovery::viewed_retry_matches(
+        &foreign, &context, &session
+    ));
+    assert!(recovery::latest_viewed_intentions(&[foreign], &context, &session).is_empty());
+    operation.state = ReviewOperationState::DeliveryUnknown;
+    assert!(!recovery::viewed_retry_matches(
+        &operation, &context, &session
+    ));
+    operation.state = ReviewOperationState::Failed;
+    operation.payload["fingerprints"]["auth.ts"] = json!("different contents");
+    assert!(!recovery::viewed_retry_matches(
+        &operation, &context, &session
+    ));
+}
+
+#[gpui::test]
+async fn review_definition_bridge_preserves_different_checkout_contents(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    let prepared = view
+        .update_in(&mut cx, |view, window, cx| {
+            view.prepare_file(
+                fixture.session.snapshot.groups[0].files[0].clone(),
+                GROUP.into(),
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let task = cx.update(|_, cx| {
+        let position = prepared.buffer.read(cx).anchor_before(0);
+        navigation::checkout_definitions(
+            &view.downgrade(),
+            &prepared.buffer,
+            position,
+            editor::GotoDefinitionKind::Symbol,
+            cx,
+        )
+        .unwrap()
+    });
+    let error = task.await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("differ from the current checkout"),
+        "{error}"
+    );
+    let path = fixture.repository.read_with(&cx, |repo, cx| {
+        repo.repo_path_to_project_path(
+            &RepoPath::from_rel_path(RelPath::from_unix_str("auth.ts").unwrap()),
+            cx,
+        )
+        .unwrap()
+    });
+    let checkout = fixture
+        .project
+        .update(&mut cx, |project, cx| project.open_buffer(path, cx))
+        .await
+        .unwrap();
+    checkout.read_with(&cx, |buffer, _| {
+        assert_eq!(buffer.text(), "WORKTREE auth\n")
+    });
+    prepared.buffer.read_with(&cx, |buffer, _| {
+        assert_eq!(buffer.text(), "reviewed auth\n")
+    });
+}
+
+#[gpui::test]
+async fn rejected_guarded_recovery_never_becomes_an_unguarded_pending_click(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx).await.unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    view.update_in(&mut cx, |view, window, cx| {
+        view.data.session.selector = ComparisonSelector::PullRequest {
+            identity: PullRequestIdentity {
+                host: "github.com".into(),
+                repository_node_id: "R_guard".into(),
+                pull_request_node_id: "PR_guard".into(),
+                viewer_node_id: "U_guard".into(),
+            },
+        };
+        let endpoints = &view.data.session.snapshot.groups[0].endpoints;
+        view.data.pull_request = Some(PullRequestMetadata {
+            owner: "example".into(),
+            repository: "repository".into(),
+            number: 42,
+            title: "Guard".into(),
+            base_ref_name: "main".into(),
+            head_ref_name: "feature".into(),
+            base_ref_oid: endpoints.left.hex.clone(),
+            head_ref_oid: endpoints.right.hex.clone(),
+            commit_count: Some(1),
+        });
+        view.github_viewed_intents.insert("auth.ts".into(), false);
+        view.set_github_paths_viewed_at_revision(
+            vec!["auth.ts".into()],
+            true,
+            None,
+            Some(view.data.session.revision + 1),
+            window,
+            cx,
+        );
+    });
+    cx.condition(&view, |view, _| {
+        !view.github_viewed_preparing && !view.github_viewed_busy
+    })
+    .await;
+    view.read_with(&cx, |view, _| {
+        assert!(view.github_viewed_error.is_some());
+        assert!(view.github_viewed_pending_clicks.is_empty());
+        assert!(!view.effective_github_viewed("auth.ts"));
+    });
+    view.update_in(&mut cx, |view, window, cx| {
+        view.github_viewed_preparing = true;
+        view.set_github_paths_viewed_at_revision(
+            vec!["auth.ts".into()],
+            true,
+            None,
+            Some(view.data.session.revision),
+            window,
+            cx,
+        );
+        assert!(
+            view.github_viewed_pending_clicks.is_empty(),
+            "busy recovery must not downgrade its guard"
+        );
+        view.github_viewed_preparing = false;
+    });
+}

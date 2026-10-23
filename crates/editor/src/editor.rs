@@ -783,6 +783,18 @@ impl BufferSerialization {
 
 /// Addons allow storing per-editor state in other crates (e.g. Vim)
 pub trait Addon: 'static {
+    /// Optional on-demand navigation for immutable buffers that are not LSP
+    /// documents. Returning None preserves the native semantics provider.
+    fn definitions(
+        &self,
+        _: &Entity<Buffer>,
+        _: text::Anchor,
+        _: GotoDefinitionKind,
+        _: &mut App,
+    ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
+        None
+    }
+
     fn extend_key_context(&self, _: &mut KeyContext, _: &App) {}
 
     fn render_buffer_header_controls(
@@ -3322,6 +3334,23 @@ impl Editor {
 
     pub fn semantics_provider(&self) -> Option<Rc<dyn SemanticsProvider>> {
         self.semantics_provider.clone()
+    }
+
+    pub(crate) fn definitions_for_buffer(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        kind: GotoDefinitionKind,
+        cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
+        for addon in self.addons.values() {
+            if let Some(task) = addon.definitions(buffer, position, kind, cx) {
+                return Some(task);
+            }
+        }
+        self.semantics_provider
+            .as_ref()?
+            .definitions(buffer, position, kind, cx)
     }
 
     pub fn set_semantics_provider(&mut self, provider: Option<Rc<dyn SemanticsProvider>>) {

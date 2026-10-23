@@ -111,7 +111,8 @@ impl Render for ReviewView {
             });
         let current = self.data.session.presentation.selected_path.clone();
         let navigation_blocked = self.outdated();
-        let writes_blocked = self.cached_unverified
+        let writes_blocked = self.recovery_running
+            || self.cached_unverified
             || self.busy
             || navigation_blocked
             || self.checking
@@ -298,7 +299,6 @@ impl Render for ReviewView {
                                         .spacing(settings.spacing)
                                         .selectable(false)
                                         .toggle_state(selected)
-                                        .disabled(navigation_blocked)
                                         .start_slot::<gpui::AnyElement>(Some(h_flex().gap_0p5().pl(px(indent_level as f32 * settings.indent_size))
                                             .child(if entry.directory {
                                                 Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).color(Color::Muted).into_any_element()
@@ -827,7 +827,7 @@ impl Render for ReviewView {
                     .child(
                         IconButton::new("review-previous", IconName::ArrowLeft)
                             .tooltip(ui::Tooltip::text("Previous visible file"))
-                            .disabled(navigation_blocked || !previous_available)
+                            .disabled(!previous_available)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.navigate_file(false, window, cx)
                             })),
@@ -835,7 +835,7 @@ impl Render for ReviewView {
                     .child(
                         IconButton::new("review-next", IconName::ArrowRight)
                             .tooltip(ui::Tooltip::text("Next visible file"))
-                            .disabled(navigation_blocked || !next_available)
+                            .disabled(!next_available)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.navigate_file(true, window, cx)
                             })),
@@ -899,9 +899,6 @@ impl Render for ReviewView {
                     }))
                     .on_drag_move::<DraggedReviewTree>(cx.listener(
                         |this, event: &gpui::DragMoveEvent<DraggedReviewTree>, _, cx| {
-                            if this.busy || this.outdated() {
-                                return;
-                            }
                             this.tree_resizing = true;
                             this.tree_width_preview = Some(bounded_tree_width(
                                 f32::from(event.event.position.x - event.bounds.left()),

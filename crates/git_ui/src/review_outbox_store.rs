@@ -28,11 +28,23 @@ pub(super) fn read_operation(connection: &Connection, id: &str) -> Result<Review
     );
     Ok(operation)
 }
+pub(super) fn ensure_active(connection: &Connection, id: &str) -> Result<()> {
+    ensure!(
+        connection.select_row_bound::<String, i64>(
+            "SELECT 1 FROM review_operation_archives WHERE operation_id = ?"
+        )?(id.to_owned())?
+        .is_none(),
+        "This local action was archived and cannot be sent or replayed"
+    );
+    Ok(())
+}
+
 pub(super) fn store_changed(
     connection: &Connection,
     mut operation: ReviewOperation,
     old_revision: u64,
 ) -> Result<ReviewOperation> {
+    ensure_active(connection, &operation.operation_id)?;
     operation.revision = old_revision
         .checked_add(1)
         .filter(|revision| *revision <= i64::MAX as u64)
@@ -56,12 +68,35 @@ impl ReviewDb {
         ensure_durable(self)?;
         identity.validate()?;
         let ids = self.select_bound::<String, String>(
-            "SELECT id FROM review_operations WHERE identity = ? ORDER BY id",
+            "SELECT id FROM review_operations WHERE identity = ? AND NOT EXISTS (SELECT 1 FROM review_operation_archives a WHERE a.operation_id = review_operations.id) ORDER BY id",
         )?(serde_json::to_string(identity)?)?;
         ids.into_iter()
             .map(|id| read_operation(self, &id))
             .collect()
     }
+    /// Archive local tracking atomically. A sending request must settle first;
+    /// unknown delivery is never converted to a definitely-unsent state.
+    pub async fn archive_operation(&self, id: String, expected_revision: u64) -> Result<()> {
+        self.write(move |connection| {
+            ensure_durable(connection)?;
+            connection.with_savepoint("review_operation_archive", || {
+                ensure_active(connection, &id)?;
+                let operation = read_operation(connection, &id)?;
+                ensure!(operation.revision == expected_revision, "Local action changed; refresh Pending actions");
+                ensure!(matches!(operation.state, ReviewOperationState::LocalDraft | ReviewOperationState::Queued | ReviewOperationState::Failed | ReviewOperationState::DeliveryUnknown),
+                    "Wait for an in-flight action to settle before removing it");
+                let reason = if operation.state == ReviewOperationState::DeliveryUnknown {
+                    "Stopped local tracking; GitHub delivery remains unconfirmed"
+                } else { "Cancelled local action before delivery" };
+                store_changed(connection, operation, expected_revision)?;
+                connection.exec_bound::<(String, i64, String)>(
+                    "INSERT INTO review_operation_archives(operation_id, archived_at, reason) VALUES (?, ?, ?)"
+                )?((id, now()? as i64, reason.to_owned()))?;
+                Ok(())
+            })
+        }).await
+    }
+
     pub async fn create_operation(
         &self,
         context: ReviewOperationContext,
@@ -344,7 +379,7 @@ impl ReviewDb {
             identity.validate()?;
             connection.with_savepoint("review_operation_locations", || {
                 let ids = connection.select_bound::<String, String>(
-                    "SELECT id FROM review_operations WHERE identity = ? ORDER BY id",
+                    "SELECT id FROM review_operations WHERE identity = ? AND NOT EXISTS (SELECT 1 FROM review_operation_archives a WHERE a.operation_id = review_operations.id) ORDER BY id",
                 )?(serde_json::to_string(&identity)?)?;
                 let mut changed = Vec::new();
                 for id in ids {

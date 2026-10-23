@@ -109,9 +109,11 @@ impl ReviewIntent {
 
 pub(crate) enum GitHubReviewEvent {
     ThreadsChanged,
+    LocalOperationsChanged,
     ClosePanel,
     Compose,
     ViewedOperation(ReviewOperation, bool),
+    Recover(crate::review_view::RecoveryAction),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -173,6 +175,8 @@ pub(crate) struct GitHubReviewPanel {
     #[cfg(test)]
     delivery_pause: Option<crate::review_outbox_runtime::Recovery>,
     writing: bool,
+    bulk_running: bool,
+    bulk_status: Option<String>,
     reconciling: bool,
     generation: u64,
     canonical_threads_generation: Option<u64>,
@@ -259,6 +263,8 @@ impl GitHubReviewPanel {
             #[cfg(test)]
             delivery_pause: None,
             writing: false,
+            bulk_running: false,
+            bulk_status: None,
             reconciling: false,
             generation: 0,
             canonical_threads_generation: None,
@@ -444,6 +450,23 @@ impl GitHubReviewPanel {
         cx.notify();
     }
 
+    pub(crate) fn set_bulk_status(
+        &mut self,
+        running: bool,
+        status: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.bulk_running = running;
+        self.bulk_status = Some(status);
+        cx.notify();
+    }
+    pub(crate) fn delivery_busy(&self) -> bool {
+        self.writing
+    }
+    pub(crate) fn has_composer(&self) -> bool {
+        self.intent.is_some()
+    }
+
     pub(crate) fn showing_pending_actions(&self) -> bool {
         self.pending_actions_mode
     }
@@ -472,7 +495,7 @@ impl GitHubReviewPanel {
             .copied()
             .unwrap_or(!thread.is_resolved)
     }
-    fn retry_failed_operation(
+    pub(crate) fn retry_failed_operation(
         &mut self,
         operation: ReviewOperation,
         window: &mut Window,
@@ -1318,7 +1341,7 @@ impl GitHubReviewPanel {
         cx.notify();
     }
 
-    fn reconcile(
+    pub(crate) fn reconcile(
         &mut self,
         operation: ReviewOperation,
         window: &mut Window,
@@ -1560,6 +1583,61 @@ impl GitHubReviewPanel {
         })
         .detach();
     }
+    fn archive_local_action(
+        &mut self,
+        operation: ReviewOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unknown = operation.state == ReviewOperationState::DeliveryUnknown;
+        let answer = window.prompt(gpui::PromptLevel::Warning,
+            if unknown { "Stop tracking this unconfirmed action?" } else { "Cancel this queued action?" },
+            Some(if unknown { "This archives local tracking only. GitHub may already contain the change; it will not be undone or resent." }
+                 else { "The action will be archived locally. An already sending request cannot be cancelled." }),
+            &[if unknown { "Stop tracking" } else { "Cancel action" }, "Keep action"], cx);
+        let db = self.db.clone();
+        cx.spawn_in(window, async move |panel, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            let id = operation.operation_id.clone();
+            let result = cx
+                .background_spawn(async move {
+                    db.archive_operation(operation.operation_id, operation.revision)
+                        .await
+                })
+                .await;
+            panel
+                .update(cx, |panel, cx| {
+                    match result {
+                        Ok(()) => {
+                            panel
+                                .operations
+                                .retain(|operation| operation.operation_id != id);
+                            if panel
+                                .draft
+                                .as_ref()
+                                .is_some_and(|draft| draft.operation_id == id)
+                            {
+                                panel.intent = None;
+                                panel.draft = None;
+                                cx.emit(GitHubReviewEvent::Compose);
+                            }
+                            panel.notice =
+                                Some("Local action archived. GitHub was not modified.".into());
+                            cx.emit(GitHubReviewEvent::LocalOperationsChanged);
+                        }
+                        Err(error) => {
+                            panel.error = Some(format!("Cannot archive this action: {error:#}"))
+                        }
+                    }
+                    cx.notify();
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
     fn discard_draft(
         &mut self,
         operation: ReviewOperation,

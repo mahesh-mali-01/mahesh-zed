@@ -7230,6 +7230,7 @@ dependencies = [
  "telemetry",
  "tempfile",
  "terminal",
+ "text",
  "theme",
  "theme_settings",
  "time",

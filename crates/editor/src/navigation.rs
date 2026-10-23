@@ -1319,7 +1319,6 @@ impl Editor {
         kind: GotoDefinitionKind,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Vec<Location>>>> {
-        let provider = self.semantics_provider.clone()?;
         let selection = self.selections.newest_anchor();
         let multi_buffer = self.buffer.read(cx);
         let multi_buffer_snapshot = multi_buffer.snapshot(cx);
@@ -1328,7 +1327,7 @@ impl Editor {
             .head();
 
         let (buffer, head) = multi_buffer.text_anchor_for_position(head, cx)?;
-        let definitions = provider.definitions(&buffer, head, kind, cx)?;
+        let definitions = self.definitions_for_buffer(&buffer, head, kind, cx)?;
         Some(cx.spawn(async move |editor, cx| {
             let definitions = definitions.await?.unwrap_or_default();
             // Drop a result that points back at the cursor, matching
@@ -2398,9 +2397,6 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Navigated>> {
-        let Some(provider) = self.semantics_provider.clone() else {
-            return Task::ready(Ok(Navigated::No));
-        };
         let head = self
             .selections
             .newest::<MultiBufferOffset>(&self.display_snapshot(cx))
@@ -2409,7 +2405,7 @@ impl Editor {
         let Some((buffer, head)) = buffer.text_anchor_for_position(head, cx) else {
             return Task::ready(Ok(Navigated::No));
         };
-        let Some(definitions) = provider.definitions(&buffer, head, kind, cx) else {
+        let Some(definitions) = self.definitions_for_buffer(&buffer, head, kind, cx) else {
             return Task::ready(Ok(Navigated::No));
         };
 

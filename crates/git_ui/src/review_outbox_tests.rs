@@ -421,3 +421,61 @@ fn review_outbox_routes_failed_comment_into_existing_review_without_changing_ide
     );
     Ok(())
 }
+
+#[test]
+fn archived_queued_operation_cannot_be_claimed_and_audit_survives_restart() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("archive.sqlite");
+    let db = outbox_db(&path)?;
+    let draft = create(&db)?;
+    let queued = block_on(db.queue_operation(draft.operation_id.clone(), draft.revision))?;
+    block_on(db.archive_operation(queued.operation_id.clone(), queued.revision))?;
+    assert!(db.operations(context("U_viewer").identity()?)?.is_empty());
+    assert!(
+        block_on(db.claim_operation(queued.operation_id.clone(), queued.revision, vec![])).is_err()
+    );
+    let archived = db.operation(&queued.operation_id)?;
+    assert_eq!(archived.payload, draft.payload);
+    assert!(
+        block_on(db.claim_operation(archived.operation_id.clone(), archived.revision, vec![]))
+            .is_err()
+    );
+    drop(db);
+    let restored = outbox_db(&path)?;
+    assert!(
+        restored
+            .operations(context("U_viewer").identity()?)?
+            .is_empty()
+    );
+    assert_eq!(
+        restored.operation(&queued.operation_id)?.payload,
+        draft.payload
+    );
+    Ok(())
+}
+
+#[test]
+fn archive_never_cancels_sending_or_replays_unknown_delivery() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let db = outbox_db(&directory.path().join("archive.sqlite"))?;
+    let sending = sending(&db)?;
+    assert!(
+        block_on(db.archive_operation(sending.operation_id.clone(), sending.revision)).is_err()
+    );
+    let unknown = block_on(db.finish_operation(
+        sending.operation_id,
+        sending.revision,
+        ReviewOperationOutcome::DeliveryUnknown {
+            reason: "Response lost".into(),
+        },
+    ))?;
+    assert!(
+        block_on(db.archive_operation(unknown.operation_id.clone(), unknown.revision + 1)).is_err()
+    );
+    block_on(db.archive_operation(unknown.operation_id.clone(), unknown.revision))?;
+    let archived = db.operation(&unknown.operation_id)?;
+    assert_eq!(archived.state, ReviewOperationState::DeliveryUnknown);
+    assert!(db.operations(context("U_viewer").identity()?)?.is_empty());
+    assert!(block_on(db.queue_operation(archived.operation_id, archived.revision)).is_err());
+    Ok(())
+}

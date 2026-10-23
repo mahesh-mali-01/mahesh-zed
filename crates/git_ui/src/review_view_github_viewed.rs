@@ -137,7 +137,7 @@ impl ViewedWork {
 }
 
 impl ReviewView {
-    fn github_viewed_context(&self) -> Result<(ReviewOperationContext, ReviewContext)> {
+    pub(super) fn github_viewed_context(&self) -> Result<(ReviewOperationContext, ReviewContext)> {
         ensure!(
             self.data.session.selector.supports_github_viewed(),
             "Only All PR changes synchronizes GitHub Viewed state"
@@ -304,6 +304,23 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.set_github_paths_viewed_at_revision(paths, viewed, existing, None, window, cx);
+    }
+
+    pub(super) fn set_github_paths_viewed_at_revision(
+        &mut self,
+        paths: Vec<String>,
+        viewed: bool,
+        existing: Option<ReviewOperation>,
+        expected_revision: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if expected_revision.is_some() && (self.github_viewed_preparing || self.refreshing) {
+            self.github_viewed_error = Some("Recovery was interrupted by another active change. The original action remains tracked; no stale intention was queued.".into());
+            cx.notify();
+            return;
+        }
         if self.github_viewed_preparing {
             // Preserve every rapid user action while immutable contents are
             // retained. Latest click wins per path; saving is shown until durable.
@@ -407,7 +424,9 @@ impl ReviewView {
                                     && current.selector == expected_session.selector,
                                 "Review changed before saving Viewed clicks"
                             );
-                            let target = sync_target(&current, current.revision);
+                            ensure!(expected_revision.is_none_or(|expected| current.revision == expected),
+                                "Another window changed review intent during recovery. Your newer intent was preserved; run recovery again");
+                            let target = sync_target(&current, expected_revision.unwrap_or(current.revision));
                             db.accept_github_viewed_intent(
                                 target,
                                 context,
@@ -471,10 +490,13 @@ impl ReviewView {
                         }
                     }
                     Err(error) => {
-                        for path in &paths {
-                            this.github_viewed_pending_clicks
-                                .entry(path.clone())
-                                .or_insert(viewed);
+                        // Recovery is based on a guarded snapshot, not a new
+                        // user gesture. Never turn rejected recovery into an
+                        // unguarded pending click that could overwrite newer intent.
+                        if expected_revision.is_none() {
+                            for path in &paths {
+                                this.github_viewed_pending_clicks.entry(path.clone()).or_insert(viewed);
+                            }
                         }
                         this.github_viewed_resume_origin = None;
                         this.github_viewed_busy = false;
@@ -675,7 +697,11 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy || self.github_viewed_busy || self.refreshing || self.outdated() {
+        if self.github_viewed_busy || self.refreshing || self.outdated() {
+            self.github_viewed_error = Some(if self.outdated() {
+                "This review has newer saved state. Refresh & recover before retrying this action."
+            } else { "Another synchronization is active. This action remains saved; retry when it finishes." }.into());
+            cx.notify();
             return;
         }
         if !reconcile {

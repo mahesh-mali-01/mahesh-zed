@@ -422,6 +422,40 @@ provides recovery information. If delivery is uncertain, reconcile with GitHub
 before retrying to avoid duplicate comments. Changing accounts or advancing the
 pull request can require Refresh before a new write is permitted.
 
+Use the controls at the top of **Pending actions** to recover the current PR:
+
+- **Refresh & recover** updates the comparison, verifies unknown deliveries and
+  retries eligible unsent actions. A failed Viewed intention carries forward
+  only when its reviewed file comparison is unchanged. Newer local intentions
+  take precedence, including changes from another window.
+- **Verify deliveries** reads GitHub without resending unconfirmed writes.
+- **Retry failed** retries definitely-unsent actions against the current
+  comparison. It does not publish unfinished local drafts.
+- **More recovery options** cancels unsent actions or stops tracking unconfirmed
+  deliveries. Both archive the local recovery record. Stopping tracking does not
+  undo a change that may already exist on GitHub. Sending actions cannot be
+  cancelled.
+
+Recovery reports confirmed, requeued and remaining actions. You can continue
+browsing the file tree and reading the pinned comparison during synchronization.
+A changed PR head or target branch can require Refresh even when your local
+checkout has not changed. A newer comparison blocks writes until revalidation;
+it does not prevent reading the snapshot already displayed.
+
+### Navigate From Review Contents
+
+Use {#action editor::GoToDefinition} or the editor's modifier-click navigation
+from a review buffer to look up a symbol in the current checkout. Zed loads the
+checkout file on demand and uses its existing language server only when the
+contents match the reviewed buffer. Definitions open through native editor
+navigation; the PR review stays open.
+
+Historical or changed checkout contents cannot safely share source positions.
+Use **Open File: Current checkout** in the view menu and **Open File** to navigate
+those files. Missing checkout files, unavailable language servers and large
+files can prevent lookup. Review navigation does not index an entire historical
+checkout or make the reviewed buffer editable.
+
 Local review storage can include snapshots, retained source contents, drafts
 and delivery records. These belong to the current Zed profile and are not
 committed to the reviewed repository. Retained contents do not currently have

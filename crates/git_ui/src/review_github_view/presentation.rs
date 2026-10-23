@@ -996,6 +996,77 @@ impl Render for GitHubReviewPanel {
                             ),
                     ),
             );
+        if self.pending_actions_mode && !self.preview {
+            use crate::review_view::RecoveryAction;
+            content = content.child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(
+                        Button::new("pending-refresh-recover", "Refresh & recover")
+                            .style(ButtonStyle::Filled)
+                            .disabled(self.bulk_running)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(GitHubReviewEvent::Recover(
+                                    RecoveryAction::RefreshAndRecover,
+                                ))
+                            })),
+                    )
+                    .child(
+                        Button::new("pending-retry-all", "Retry failed")
+                            .style(ButtonStyle::Outlined)
+                            .disabled(self.bulk_running)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(GitHubReviewEvent::Recover(RecoveryAction::Retry))
+                            })),
+                    )
+                    .child(
+                        Button::new("pending-verify-all", "Verify deliveries")
+                            .style(ButtonStyle::Outlined)
+                            .disabled(self.bulk_running)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(GitHubReviewEvent::Recover(RecoveryAction::Verify))
+                            })),
+                    ),
+            );
+            let weak = cx.entity().downgrade();
+            let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                let cancel = weak.clone();
+                menu.entry("Discard unsent actions…", None, move |_, cx| {
+                    cancel
+                        .update(cx, |_, cx| {
+                            cx.emit(GitHubReviewEvent::Recover(RecoveryAction::DiscardUnsent))
+                        })
+                        .log_err();
+                })
+                .entry(
+                    "Stop tracking unconfirmed actions…",
+                    None,
+                    move |_, cx| {
+                        weak.update(cx, |_, cx| {
+                            cx.emit(GitHubReviewEvent::Recover(RecoveryAction::StopTracking))
+                        })
+                        .log_err();
+                    },
+                )
+            });
+            content = content.child(
+                DropdownMenu::new("pending-recovery-more", "More recovery options", menu)
+                    .style(ui::DropdownStyle::Outlined)
+                    .disabled(self.bulk_running)
+                    .attach(gpui::Anchor::BottomLeft)
+                    .offset(gpui::point(px(0.), px(6.))),
+            );
+            if let Some(status) = &self.bulk_status {
+                content = content.child(
+                    h_flex()
+                        .gap_2()
+                        .when(self.bulk_running, |row| row.child(ui::SpinnerLabel::new()))
+                        .child(Label::new(status.clone()).size(LabelSize::Small)),
+                );
+            }
+        }
         if self.preview {
             content = content.child(
                 h_flex()
@@ -1386,6 +1457,27 @@ impl Render for GitHubReviewPanel {
                     .disabled(self.writing)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.reconcile(unknown.clone(), window, cx)
+                    })),
+                );
+            }
+            if matches!(
+                operation.state,
+                ReviewOperationState::Queued | ReviewOperationState::DeliveryUnknown
+            ) {
+                let archived = operation.clone();
+                row = row.child(
+                    Button::new(
+                        SharedString::from(format!("github-archive:{}", operation.operation_id)),
+                        if operation.state == ReviewOperationState::DeliveryUnknown {
+                            "Stop tracking…"
+                        } else {
+                            "Cancel queued…"
+                        },
+                    )
+                    .style(ButtonStyle::Outlined)
+                    .disabled(self.bulk_running)
+                    .on_click(cx.listener(move |panel, _, window, cx| {
+                        panel.archive_local_action(archived.clone(), window, cx)
                     })),
                 );
             }
