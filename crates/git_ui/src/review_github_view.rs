@@ -475,6 +475,10 @@ impl GitHubReviewPanel {
         ) = state;
     }
 
+    pub(crate) fn local_operations(&self) -> &[ReviewOperation] {
+        &self.operations
+    }
+
     pub(crate) fn delivery_busy(&self) -> bool {
         self.writing
     }
@@ -1919,6 +1923,7 @@ impl GitHubReviewPanel {
                         for operation in operations {
                             this.upsert_operation(operation);
                         }
+                        cx.emit(GitHubReviewEvent::LocalOperationsChanged);
                         cx.emit(GitHubReviewEvent::ThreadsChanged);
                     }
                     Err(error) => {

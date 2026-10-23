@@ -93,7 +93,7 @@ fn viewed_readback_authoritative(current: &ReviewSession, observed: &ReviewSessi
         && observed.revision >= current.revision
 }
 
-fn remaining_after_read(
+pub(super) fn remaining_after_read(
     operation: &ReviewOperation,
     paths: &[String],
     viewed: bool,
@@ -160,6 +160,44 @@ impl ReviewView {
         };
         context.validate()?;
         Ok((operation, context))
+    }
+
+    pub(super) fn adopt_active_viewed_operations(&mut self, operations: &[ReviewOperation]) {
+        let active = operations
+            .iter()
+            .filter(|operation| operation.kind == ReviewOperationKind::SetFileViewed)
+            .collect::<Vec<_>>();
+        if self
+            .github_viewed_remaining
+            .as_ref()
+            .is_some_and(|remaining| {
+                !active
+                    .iter()
+                    .any(|operation| operation.operation_id == remaining.origin.operation_id)
+            })
+        {
+            self.github_viewed_remaining = None;
+        }
+        if self
+            .github_viewed_resume_origin
+            .as_ref()
+            .is_some_and(|(origin, _)| {
+                !active
+                    .iter()
+                    .any(|operation| operation.operation_id == origin.operation_id)
+            })
+        {
+            self.github_viewed_resume_origin = None;
+        }
+        self.github_viewed_error = active
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation.state,
+                    ReviewOperationState::Failed | ReviewOperationState::DeliveryUnknown
+                )
+            })
+            .find_map(|operation| operation.last_error.clone());
     }
 
     pub(super) fn github_viewed_needs_sync(&self) -> bool {

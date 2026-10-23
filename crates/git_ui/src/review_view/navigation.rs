@@ -1,6 +1,6 @@
 //! Use native checkout LSP navigation only when snapshot positions are exact.
 use super::*;
-use language::ToOffset as _;
+use language::{ToOffset as _, ToPointUtf16 as _};
 
 const NAVIGATION_TEXT_BUDGET: usize = 2 * 1024 * 1024;
 
@@ -65,7 +65,11 @@ pub(super) fn checkout_definitions(
             let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
             let buffer_id = checkout.read_with(cx, |buffer, _| buffer.remote_id());
             let started = Instant::now();
-            while !lsp_store.read_with(cx, |store, _| store.language_server_ids_for_opened_buffer(buffer_id).is_some_and(|ids| !ids.is_empty())) {
+            while !lsp_store.update(cx, |store, cx| {
+                let ids = store.language_server_ids_for_opened_buffer(buffer_id).cloned().unwrap_or_default();
+                let request = project::lsp_command::GetDefinitions { position: offset.to_point_utf16(checkout.read(cx)) };
+                ids.into_iter().any(|id| store.language_server_capable_of_lsp_request(&checkout, id, &request, cx))
+            }) {
                 ensure!(started.elapsed() < std::time::Duration::from_secs(5),
                     "The current file's language server is starting or unavailable. Try Go to Definition again, or use Open current file to inspect its language-server status");
                 cx.background_executor().timer(std::time::Duration::from_millis(100)).await;

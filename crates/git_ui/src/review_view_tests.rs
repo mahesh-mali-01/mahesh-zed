@@ -5563,3 +5563,52 @@ async fn rejected_guarded_recovery_never_becomes_an_unguarded_pending_click(
         view.github_viewed_preparing = false;
     });
 }
+
+#[gpui::test]
+async fn archiving_unknown_viewed_action_clears_header_resume_state(cx: &mut TestAppContext) {
+    let fixture = fixture(cx).await.unwrap();
+    let session = viewed_sync_session(&fixture).await.unwrap();
+    let data = read_data(&fixture.db, session.clone()).unwrap();
+    let context = ReviewOperationContext {
+        selector: session.selector.clone(),
+        metadata: data.pull_request.clone().unwrap(),
+    };
+    let intent = github_viewed::viewed_intent(&session, vec!["auth.ts".into()], true).unwrap();
+    let mut operation = fixture
+        .db
+        .create_operation(
+            context,
+            ReviewOperationKind::SetFileViewed,
+            serde_json::to_value(intent).unwrap(),
+            ReviewLocationState::NotRequired,
+        )
+        .await
+        .unwrap();
+    operation.state = ReviewOperationState::DeliveryUnknown;
+    operation.last_error = Some("Delivery unconfirmed".into());
+    let remote = vec![crate::github_review::RemoteViewedFile {
+        path: "auth.ts".into(),
+        viewer_viewed_state: crate::github_review::ViewedState::Unviewed,
+    }];
+    let remaining = github_viewed::remaining_after_read(
+        &operation,
+        &["auth.ts".into()],
+        true,
+        session.snapshot.generation,
+        &remote,
+    )
+    .unwrap();
+    let (view, mut cx) = review_window(&fixture, cx, None);
+    cx.condition(&view, |view, _| !view.busy && !view.navigation_pending)
+        .await;
+    view.update_in(&mut cx, |view, _, _| {
+        view.github_viewed_remaining = remaining;
+        view.github_viewed_resume_origin = Some((operation.clone(), vec!["auth.ts".into()]));
+        view.adopt_active_viewed_operations(&[operation]);
+        assert!(view.github_viewed_remaining.is_some() && view.github_viewed_error.is_some());
+        view.adopt_active_viewed_operations(&[]);
+        assert!(view.github_viewed_remaining.is_none());
+        assert!(view.github_viewed_resume_origin.is_none());
+        assert!(view.github_viewed_error.is_none());
+    });
+}

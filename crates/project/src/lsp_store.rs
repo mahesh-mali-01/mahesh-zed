@@ -9987,7 +9987,8 @@ impl LspStore {
             .find(|(_, s)| s.server_id() == server_id)
     }
 
-    pub(crate) fn language_server_capable_of_lsp_request<R: LspCommand>(
+    /// Whether an opened buffer's server supports a native LSP command.
+    pub fn language_server_capable_of_lsp_request<R: LspCommand>(
         &self,
         buffer: &Entity<Buffer>,
         server_id: LanguageServerId,

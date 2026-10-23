@@ -1306,9 +1306,12 @@ impl ReviewView {
                 self.github_subscriptions.push(cx.subscribe_in(
                     &panel,
                     window,
-                    |this, _, event, window, cx| {
+                    |this, panel, event, window, cx| {
                         match event {
                             GitHubReviewEvent::LocalOperationsChanged => {
+                                this.adopt_active_viewed_operations(
+                                    panel.read(cx).local_operations(),
+                                );
                                 this.reload_shared_progress(cx)
                             }
                             GitHubReviewEvent::ThreadsChanged => {
