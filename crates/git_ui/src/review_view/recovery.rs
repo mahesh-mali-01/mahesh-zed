@@ -302,7 +302,6 @@ impl ReviewView {
                         eligible.push(operation.clone());
                     }
                     let mut durably_replaced = BTreeSet::new();
-                    let mut confirmed_paths = BTreeSet::new();
                     for desired in [false, true] {
                         // Read the session before the operations. The strict
                         // transaction target below rejects any concurrent write
@@ -325,7 +324,7 @@ impl ReviewView {
                             if let Ok(intent) = serde_json::from_value::<GitHubViewedIntent>(operation.payload.clone()) {
                                 if intent.viewed == desired && intent.validate_for(&session).is_ok() {
                                     if operation.state == ReviewOperationState::Sent {
-                                        confirmed_paths.extend(intent.paths.iter().cloned());
+                                        retried += intent.paths.len();
                                     } else { attention += 1; }
                                     durably_replaced.extend(intent.paths);
                                 }
@@ -339,9 +338,7 @@ impl ReviewView {
                         if intent.paths.iter().all(|path| durably_replaced.contains(path)
                             || final_latest.get(path).is_some_and(|(id, _)| id != &operation.operation_id)) {
                             let outcome = cx.background_spawn({ let db = db.clone(); async move { db.archive_operation(operation.operation_id, operation.revision).await } }).await;
-                            if outcome.is_ok() {
-                                if intent.paths.iter().all(|path| confirmed_paths.contains(path)) { retried += 1; }
-                            } else { attention += 1; }
+                            if outcome.is_err() { attention += 1; }
                         } else { attention += 1; }
                     }
                     for operation in operations.iter().filter(|op| op.state == ReviewOperationState::Failed && op.kind != ReviewOperationKind::SetFileViewed) {
@@ -362,7 +359,7 @@ impl ReviewView {
                 let outstanding = cx.background_spawn({ let db = db.clone(); async move {
                     Ok::<_, anyhow::Error>(db.operations(&identity)?.iter().filter(|operation| !matches!(operation.state, ReviewOperationState::LocalDraft | ReviewOperationState::Sent)).count())
                 }}).await?;
-                Ok(format!("{retried} retries confirmed · {verified} earlier deliveries verified · {outstanding} actions pending · {attention} need attention. Drafts remain local."))
+                Ok(format!("{retried} retried changes confirmed · {verified} earlier deliveries verified · {outstanding} actions pending · {attention} need attention. Drafts remain local."))
             }.await;
             view.update(cx, |view, cx| {
                 view.recovery_running = false;
